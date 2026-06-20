@@ -320,7 +320,7 @@ __global__ void gqa_v2(
 //  V3 : mma + online softmax
 // =================================
 template<int Br, int Bc, int D>
-__global__ void gqa_v2(
+__global__ void gqa_v3(
   __nv_bfloat16 *d_Q,
   __nv_bfloat16 *d_K,
   __nv_bfloat16 *d_V,
@@ -402,7 +402,7 @@ void launch_gqa_v2(
 
 // V3
 template<int Br, int Bc, int D>
-void launch_gqa_v2(
+void launch_gqa_v3(
   __nv_bfloat16 *d_Q,
   __nv_bfloat16 *d_K,
   __nv_bfloat16 *d_V,
