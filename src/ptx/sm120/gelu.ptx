@@ -1,0 +1,70 @@
+.version 9.0
+.target sm_120
+.address_size 64
+
+// Kernel Signature: const float *inp, float *out, size_t N
+.visible .entry gelu_kernel(
+    .param .u64 .ptr.global.align 4 inp,
+    .param .u64 .ptr.global.align 4 out,
+    .param .u64 N
+)
+{
+    // 1. Declare Registers
+    .reg .pred    %p0;
+    .reg .b32     %r<3>;
+    .reg .f32     %f<10>;
+    .reg .b64     %rd<10>;
+
+    // 2. Load Parameters into Registers [4, 5]
+    ld.param.u64    %rd0, [inp];     // Base pointer for input
+    ld.param.u64    %rd1, [out];     // Base pointer for output
+    ld.param.u64    %rd2, [N];       // Total number of elements
+
+    // 3. Calculate Global 1D Thread Index [6-9]
+    // CUDA: size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    mov.u32         %r0, %tid.x;     // threadIdx.x
+    mov.u32         %r1, %ctaid.x;    // blockIdx.x
+    mov.u32         %r2, %ntid.x;    // blockDim.x
+    mad.lo.u32      %r0, %r1, %r2, %r0; 
+    cvt.u64.u32     %rd3, %r0;       // Convert to 64-bit index
+
+    // 4. Bounds Check [10, 11]
+    // CUDA: if (idx >= N) return;
+    setp.ge.u64     %p0, %rd3, %rd2;
+    @%p0 bra        EXIT_LABEL;
+
+    // 5. Calculate Memory Addresses [12, 13]
+    // offset = idx * sizeof(float)
+    shl.b64         %rd4, %rd3, 2;      
+    add.u64         %rd5, %rd0, %rd4;  // Address for input[idx]
+    add.u64         %rd6, %rd1, %rd4;  // Address for output[idx]
+
+    // 6. Load Input Data [5, 14]
+    ld.global.f32   %f1, [%rd5];
+
+    // 7. GELU Computation (Mathematical Approximation) [15, 16]
+    // Use Hex constants for exact floating-point values [17, 18]
+    // Constants used:
+    // 0.044715   = 0f3D37549A
+    // sqrt(2/pi) = 0f3F4C422A (~0.79788456)
+    // 1.0        = 0f3F800000
+    // 0.5        = 0f3F000000
+
+    mul.f32         %f2, %f1, %f1;           // x^2
+    mul.f32         %f3, %f2, %f1;           // x^3
+    mul.f32         %f4, %f3, 0f3D37549A;    // 0.044715 * x^3
+    add.f32         %f5, %f1, %f4;           // x + 0.044715 * x^3
+    mul.f32         %f6, %f5, 0f3F4C422A;    // sqrt(2/pi) * (...)
+    
+    tanh.approx.f32 %f7, %f6;                // tanh(...) [16, 19]
+    
+    add.f32         %f8, %f7, 0f3F800000;    // 1.0 + tanh
+    mul.f32         %f9, %f1, 0f3F000000;    // 0.5 * x
+    mul.f32         %f1, %f9, %f8;           // result = (0.5 * x) * (1.0 + tanh)
+
+    // 8. Store Result to Global Memory [20, 21]
+    st.global.f32   [%rd6], %f1;
+
+EXIT_LABEL:
+    ret; // Return from kernel [22]
+}
