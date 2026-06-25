@@ -316,36 +316,6 @@ __global__ void gqa_v2(
 
 } // end of the v2 kernel
 
-// =================================
-//  V3 : mma + online softmax
-// =================================
-template<int Br, int Bc, int D>
-__global__ void gqa_v3(
-  __nv_bfloat16 *d_Q,
-  __nv_bfloat16 *d_K,
-  __nv_bfloat16 *d_V,
-  __nv_bfloat16 *d_O,
-  float *d_LSE,
-  int B,
-  int Hq,
-  int Hkv,
-  int G,
-  int S,
-  float scale
-){
-  const int b      = blockIdx.x;
-  const int hq     = blockIdx.y;
-  const int q_tile = blockIdx.z;
-  const int hkv    = hq / G;
-  const int lane   = threadIdx.x;
-
-  const int q_row0   = q_tile * Br;
-  const int nKVTiles = S / Bc;
-
-  const long qBase  = ((long)(b * Hq + hq) * S + q_row0) * D;
-  const long kvBase = ((long)(b * Hkv + hkv) * S) * D;
-  const long lBase  = ((long)(b * Hq + hq) * S + q_row0);
-}
 
 //* Kernel Launch Function
 // V1
@@ -396,35 +366,10 @@ void launch_gqa_v2(
 
   dim3 GRID(B, Hq, S/Br);
   dim3 BLOCK(32);
-  gqa_v2<Br, Bc, D><<<GRID, BLOCK>>>(d_Q, d_K, d_V, d_O, d_LSE,
+  gqa_v1<Br, Bc, D><<<GRID, BLOCK>>>(d_Q, d_K, d_V, d_O, d_LSE,
                           B, Hq, Hkv, G, S, scale);
-}
+ }
 
-// V3
-template<int Br, int Bc, int D>
-void launch_gqa_v3(
-  __nv_bfloat16 *d_Q,
-  __nv_bfloat16 *d_K,
-  __nv_bfloat16 *d_V,
-  __nv_bfloat16 *d_O,
-  float *d_LSE,
-  int B,
-  int Hq,
-  int Hkv,
-  int G,
-  int S,
-  float scale
-){
-  // WMMA does 16x16x16 tiles, so every tiled dimension must be a multiple of 16.
-  static_assert(Br % 16 == 0, "Br must be a multiple of 16 (WMMA tile)");
-  static_assert(Bc % 16 == 0, "Bc must be a multiple of 16 (WMMA tile)");
-  static_assert(D  % 16 == 0, "D  must be a multiple of 16 (WMMA tile)");
-
-  dim3 GRID(B, Hq, S/Br);
-  dim3 BLOCK(32);
-  gqa_v3<Br, Bc, D><<<GRID, BLOCK>>>(d_Q, d_K, d_V, d_O, d_LSE,
-                          B, Hq, Hkv, G, S, scale);
-}
 
 int main(){
   constexpr int B   = 16;
@@ -468,7 +413,7 @@ int main(){
   CUDA_CHECK(cudaMemcpy(d_K, h_K, Nkv * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_V, h_V, Nkv * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
 
-  launch_gqa_v1<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, G, S, scale);
+  launch_gqa_v2<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, G, S, scale);
   
   CUDA_CHECK(cudaMemcpy(h_O, d_O, Nq  * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(h_LSE, d_LSE, Nlse * sizeof(float), cudaMemcpyDeviceToHost));

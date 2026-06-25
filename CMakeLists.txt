@@ -34,7 +34,17 @@ if(NOT GPU_CC)
 endif()
 
 message(STATUS "Target GPU compute capability: sm_${GPU_CC}")
-set(CMAKE_CUDA_ARCHITECTURES ${GPU_CC})
+if(GPU_CC EQUAL 103)
+    # tcgen05 (Tensor Memory) is a family-specific feature: it only assembles for
+    # the "a" virtual arch. NOTE: -arch=sm_103a is NOT enough — nvcc 13.0 lowers the
+    # PTX .target back to plain sm_103 and ptxas then rejects tcgen05.{alloc,mma,ld}.
+    # The virtual arch must carry the "a", so spell it out with -gencode.
+    set(CMAKE_CUDA_ARCHITECTURES OFF)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_103a,code=sm_103a")
+else()
+    set(CMAKE_CUDA_ARCHITECTURES OFF)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_120a,code=sm_120a")
+endif()
 
 # Compiler flags
 # -lineinfo  : maps profiler samples back to source lines (Nsight Compute)
