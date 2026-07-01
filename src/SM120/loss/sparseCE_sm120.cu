@@ -618,7 +618,7 @@ void launch_sparseCE_v7(
 int main(){
     std::cout << "Benchmarking Sparse Cross-Entropy kernels — Blackwell SM_120\n";
 
-    int64_t BATCH = 128;
+    int64_t BATCH = 8192;
     int64_t VOCAB = 50304;
     size_t logits_elems  = BATCH * VOCAB;
     size_t logits_bytes  = logits_elems * sizeof(float);
