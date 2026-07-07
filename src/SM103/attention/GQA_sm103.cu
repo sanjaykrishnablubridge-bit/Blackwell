@@ -55,7 +55,7 @@ __device__ inline void computeScores(const __nv_bfloat16 *sQ,
 //  separate so the math is easy to follow. Cost: Q·Kᵀ is computed twice.)
 // ---------------------------------------------------------------------------
 template<int Br, int Bc, int D>
-__global__ void gqa_v1(
+__global__ void gqa_v0(
   __nv_bfloat16 *d_Q,
   __nv_bfloat16 *d_K,
   __nv_bfloat16 *d_V,
@@ -184,7 +184,7 @@ __global__ void gqa_v1(
 //  V2 : wmma + online softmax
 // =================================
 template<int Br, int Bc, int D>
-__global__ void gqa_v2(
+__global__ void gqa_v1(
   __nv_bfloat16 *d_Q,
   __nv_bfloat16 *d_K,
   __nv_bfloat16 *d_V,
@@ -478,7 +478,7 @@ __device__ void tmem_readout_to_smem(
 }
 
 template<int Br, int Bc, int D>
-__global__ void gqa_v3(
+__global__ void gqa_v2(
   __nv_bfloat16 *d_Q,
   __nv_bfloat16 *d_K,
   __nv_bfloat16 *d_V,
@@ -760,7 +760,7 @@ __device__ __forceinline__ void prefetch_kv_tile(
 }
 
 template<int Br, int Bc, int D>
-__global__ void gqa_v4(
+__global__ void gqa_v3(
   __nv_bfloat16 *d_Q,
   __nv_bfloat16 *d_K,
   __nv_bfloat16 *d_V,
@@ -988,7 +988,7 @@ __device__ void tmem_readout_to_smem_vec(
 }
 
 template<int Br, int Bc, int D>
-__global__ void gqa_v5(
+__global__ void gqa_v4(
   __nv_bfloat16 *d_Q,
   __nv_bfloat16 *d_K,
   __nv_bfloat16 *d_V,
@@ -1189,7 +1189,7 @@ __device__ __forceinline__ void tma_load_2d(uint32_t smem_addr, const void* tmap
 }
 
 template<int Br, int Bc, int D>
-__global__ void gqa_v6(
+__global__ void gqa_v5(
   __nv_bfloat16 *d_Q,
   __nv_bfloat16 *d_O,
   float *d_LSE,
@@ -1397,7 +1397,7 @@ __global__ void gqa_v6(
 //* One warp per block because WMMA is a warp-collective op. Tiles live in static
 //* __shared__ memory (sizes are compile-time via Br/Bc/D), so no dynamic smem.
 template<int Br, int Bc, int D>
-void launch_gqa_v1(
+void launch_gqa_v0(
   __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
   __nv_bfloat16 *d_O, float *d_LSE,
   int B, int Hq, int Hkv, int S, int G, float scale
@@ -1410,7 +1410,7 @@ void launch_gqa_v1(
 
 // V2 — same signature as launch_gqa_v1 so callers are interchangeable.
 template<int Br, int Bc, int D>
-void launch_gqa_v2(
+void launch_gqa_v1(
   __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
   __nv_bfloat16 *d_O, float *d_LSE,
   int B, int Hq, int Hkv, int S, int G, float scale
@@ -1429,7 +1429,7 @@ void launch_gqa_v2(
 
 // V3
 template<int Br, int Bc, int D>
-void launch_gqa_v3(
+void launch_gqa_v2(
   __nv_bfloat16 *d_Q,
   __nv_bfloat16 *d_K,
   __nv_bfloat16 *d_V,
@@ -1469,7 +1469,7 @@ void launch_gqa_v3(
 
 // V4 — same signature/launch as V3; cp.async double-buffered KV loads.
 template<int Br, int Bc, int D>
-void launch_gqa_v4(
+void launch_gqa_v3(
   __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
   __nv_bfloat16 *d_O, float *d_LSE,
   int B, int Hq, int Hkv, int S, int G, float scale
@@ -1497,7 +1497,7 @@ void launch_gqa_v4(
 
 // V5 — V4 (cp.async pipeline) + vectorized TMEM readout.
 template<int Br, int Bc, int D>
-void launch_gqa_v5(
+void launch_gqa_v4(
   __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
   __nv_bfloat16 *d_O, float *d_LSE,
   int B, int Hq, int Hkv, int S, int G, float scale
@@ -1540,7 +1540,7 @@ static CUtensorMap make_tma_2d(__nv_bfloat16* gptr, uint64_t rows, uint64_t cols
 // V6 — V5 + TMA KV loads. Same signature as the others so the bench lambda is uniform;
 // the K/V tensor maps are built once (they only depend on the fixed d_K/d_V pointers).
 template<int Br, int Bc, int D>
-void launch_gqa_v6(
+void launch_gqa_v5(
   __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
   __nv_bfloat16 *d_O, float *d_LSE,
   int B, int Hq, int Hkv, int S, int G, float scale
@@ -1570,7 +1570,7 @@ void launch_gqa_v6(
 // V7 — V6+ Br = 128. Same signature as the others so the bench lambda is uniform;
 // the K/V tensor maps are built once (they only depend on the fixed d_K/d_V pointers).
 template<int Br, int Bc, int D>
-void launch_gqa_v7(
+void launch_gqa_v6(
   __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
   __nv_bfloat16 *d_O, float *d_LSE,
   int B, int Hq, int Hkv, int S, int G, float scale
@@ -1675,7 +1675,7 @@ int main(){
 
   //* ── Correctness check (bf16 → loose tolerance vs PyTorch bf16 SDPA) ──
   if(has_ref){
-    launch_gqa_v1<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    launch_gqa_v0<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
@@ -1693,7 +1693,7 @@ int main(){
     std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
 
     // ── V2 : WMMA online softmax — same bf16 in / bf16 out comparison path ──
-    launch_gqa_v2<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    launch_gqa_v1<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
@@ -1709,7 +1709,7 @@ int main(){
     std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
 
     // ── V3 : tcgen05 online softmax (Br = 64, 4 warps/block) ──
-    launch_gqa_v3<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    launch_gqa_v2<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
@@ -1724,7 +1724,7 @@ int main(){
     std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
 
     // ── V4 : tcgen05 + cp.async double-buffered KV loads ──
-    launch_gqa_v4<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    launch_gqa_v3<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
@@ -1739,7 +1739,7 @@ int main(){
     std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
 
     // ── V5 : V4 + vectorized TMEM readout ──
-    launch_gqa_v5<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    launch_gqa_v4<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
@@ -1754,7 +1754,7 @@ int main(){
     std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
 
     // ── V6 : V5 + TMA KV loads ──
-    launch_gqa_v6<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    launch_gqa_v5<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
@@ -1769,7 +1769,7 @@ int main(){
     std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
 
     // ── V7 : V6 + Br = 128 ──
-    launch_gqa_v7<Br_128, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    launch_gqa_v6<Br_128, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
@@ -1793,47 +1793,47 @@ int main(){
   //* actually re-reads K/V many times, so this GB/s is an ideal, not effective.
   size_t bytes = (2 * Nq + 2 * Nkv) * sizeof(__nv_bfloat16) + Nlse * sizeof(float);
 
+  KernelStats stats_v0 = benchmarkKernel(
+    [&](){ launch_gqa_v0<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
+    100, 25, flops, bytes
+  );
+  displayStats("V0 — WMMA two-pass (stable softmax, bf16)", stats_v0);
+
   KernelStats stats_v1 = benchmarkKernel(
     [&](){ launch_gqa_v1<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
     100, 25, flops, bytes
   );
-  displayStats("V1 — WMMA two-pass (stable softmax, bf16)", stats_v1);
+  displayStats("V1 — WMMA online softmax (single-pass, bf16)", stats_v1);
 
   KernelStats stats_v2 = benchmarkKernel(
     [&](){ launch_gqa_v2<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
     100, 25, flops, bytes
   );
-  displayStats("V2 — WMMA online softmax (single-pass, bf16)", stats_v2);
+  displayStats("V2 — tcgen05 online softmax (single-pass, bf16)", stats_v2);
 
   KernelStats stats_v3 = benchmarkKernel(
     [&](){ launch_gqa_v3<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
     100, 25, flops, bytes
   );
-  displayStats("V3 — tcgen05 online softmax (single-pass, bf16)", stats_v3);
+  displayStats("V3 — tcgen05 + cp.async KV pipeline (single-pass, bf16)", stats_v3);
 
   KernelStats stats_v4 = benchmarkKernel(
     [&](){ launch_gqa_v4<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
     100, 25, flops, bytes
   );
-  displayStats("V4 — tcgen05 + cp.async KV pipeline (single-pass, bf16)", stats_v4);
+  displayStats("V4 — V3 + vectorized TMEM readout (single-pass, bf16)", stats_v4);
 
   KernelStats stats_v5 = benchmarkKernel(
     [&](){ launch_gqa_v5<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
     100, 25, flops, bytes
   );
-  displayStats("V5 — V4 + vectorized TMEM readout (single-pass, bf16)", stats_v5);
+  displayStats("V5 — V4 + TMA KV loads (single-pass, bf16)", stats_v5);
 
   KernelStats stats_v6 = benchmarkKernel(
-    [&](){ launch_gqa_v6<Br_64, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
+    [&](){ launch_gqa_v6<Br_128, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
     100, 25, flops, bytes
   );
-  displayStats("V6 — V5 + TMA KV loads (single-pass, bf16)", stats_v6);
-
-  KernelStats stats_v7 = benchmarkKernel(
-    [&](){ launch_gqa_v7<Br_128, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
-    100, 25, flops, bytes
-  );
-  displayStats("V7 — V6 + Br = 128 (single-pass, bf16)", stats_v7);
+  displayStats("V6 — V5 + Br = 128 (single-pass, bf16)", stats_v6);
 
   CUDA_CHECK(cudaFree(d_Q));
   CUDA_CHECK(cudaFree(d_K));
