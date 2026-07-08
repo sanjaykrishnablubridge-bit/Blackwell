@@ -1,0 +1,45 @@
+Here's the concrete list of optimizations I can identify from the instruction stream, grouped by category:
+1. 2-CTA Cluster / Cooperative Grid Array (CGA) execution
+
+CS2R.32 SR_CgaSize, UCGABAR_ARV / UCGABAR_WAIT, SR_CgaCtaId — the kernel launches CTA pairs as a cluster (Blackwell's paired-CTA MMA mode) and uses cluster-level barriers to synchronize the two CTAs before/after shared MMA work.
+UTCHMMA.2CTA (every single MMA in this kernel is the 2-CTA variant) — confirms the QKᵀ and PV matmuls are done as a single logical MMA spanning both CTAs in the cluster, doubling effective tile size/throughput per MMA issue versus 1-SM mode.
+
+2. Warp specialization with dynamic register repartitioning
+
+USETMAXREG.TRY_ALLOC.CTAPOOL UP0, 0xc0 then later USETMAXREG.DEALLOC.CTAPOOL 0x58 / 0x28 — this is the producer/consumer warpgroup pattern: MMA-consumer warps grab up to 192 registers, while TMA-producer and softmax/epilogue warps give back down to 40/88. This is the standard Hopper/Blackwell trick to avoid register pressure limiting occupancy when different warpgroups do very different work (pure async copy vs. heavy MMA/softmax math).
+Distinct code regions guarded by WARPSYNC.ALL and warp-id predicates (ISETP on SR_TID.X ranges like 0x80, 0xff) — clean separation of producer warps (TMA issue), MMA warps, and softmax/correction warps.
+
+3. TMA (Tensor Memory Accelerator) async loads
+
+UTMALDG.4D.2CTA — 4D tensor loads issued once and multicast to both CTAs of the cluster (.2CTA), meaning K/V tiles are fetched from HBM once and shared across the pair rather than duplicated — direct GQA/cluster bandwidth saving.
+Paired with SYNCS.ARRIVE.TRANS64 / SYNCS.PHASECHK.TRANS64.TRYWAIT mbarrier machinery for producer→consumer handoff (async-copy-then-wait, no polling stalls).
+
+4. Tensor Memory (TMEM) as the accumulator, not registers
+
+LDTM.x32 / STTM.x16 — the QKᵀ (and PV) MMA accumulators live in dedicated Tensor Memory, not the register file. Softmax math reads straight out of TMEM (LDTM) and rescaled/corrected values are written back (STTM) — this is the Blackwell tcgen05 model, and it's what frees up the register budget point above.
+$__cuda_sm10x_tcgen05_guardrail_trap_* calls — compiler-inserted runtime guardrails for TMEM allocation/deallocation correctness (alloc/dealloc phase checks). This tells you the kernel is doing manual/fine-grained TMEM buffer alloc-dealloc cycling (double-buffered TMEM tiles), not a single static allocation.
+
+5. Online softmax, fused and numerically tuned
+
+FMNMX3.FTZ (three-way min/max in one instruction) used repeatedly to compute the running row-max over groups of accumulator elements — classic online-softmax max-tracking, done at 3-wide granularity for instruction efficiency.
+FMUL.FTZ ... 1.4426950216293334961 = log2(e) — logits are pre-scaled by log2(e) so that…
+MUFU.EX2 (hardware base-2 exponential unit) is used instead of MUFU.EX for the exp() in softmax — this is the well-known "compute exp2 instead of exp" trick (avoids an extra multiply-by-log2e per element inside the transcendental, and EX2 is the native SFU op) — used almost 100 times, i.e. applied per-accumulator-element across the whole tile.
+FSETP.NEU.FTZ.AND ... -INF — explicit -∞ initialization/check for the running max register, standard flash-attention safe-softmax init.
+Rescaling of the O accumulator and running sum by the max-correction factor is interleaved with the MMA epilogue rather than done as a separate pass.
+
+6. Output precision handling
+
+F2FP.BF16.F32.PACK_AB (~128 occurrences) — final softmax-probabilities / output values are computed in FP32 internally then packed down to BF16 pairs for the PV matmul input and/or output write. This is deliberate mixed precision: FP32 accuracy for the softmax reduction, BF16 for the tensor-core matmul operand and/or HBM write to save bandwidth.
+
+7. Shared memory staging for the P matrix (softmax probs → PV operand)
+
+STS.128 writes of the packed BF16 probabilities into shared memory — the probability tile is never round-tripped to HBM; it goes MMA accumulator (TMEM) → softmax math (registers) → shared memory → immediately consumed as the "A" operand of the second MMA (UTCHMMA.2CTA again). This is the fused FlashAttention structure I mentioned earlier, confirmed at the instruction level.
+
+8. Lock-free synchronization via warp-aggregated atomics
+
+REDUX (warp-wide reduction op) combined with ATOMS.OR / ATOMS.XOR / ATOMS.AND on small counters — used for lightweight cross-CTA/cross-warp signaling (likely tile-scheduling/work-queue bits for the persistent kernel's next-tile dispatch, or barrier phase-bit toggling), rather than a full mbarrier for cheap bookkeeping.
+UTCATOMSWS.2CTA.FIND_AND_SET.ALIGN / UTCATOMSWS.AND — TMEM-allocator-specific atomic find-and-set, i.e. the runtime TMEM buffer slot allocator for double/multi-buffering MMA accumulator tiles across iterations.
+
+9. Persistent kernel / dynamic scheduling
+
+Early code computes CTAID.X/Y/Z against grid dimension uniforms (UR38/UR39) with division-like float reciprocal tricks (I2FP→FMUL→F2I) to derive a linearized/remapped tile index — a strong signature of a persistent kernel doing software tile-index remapping (e.g. swizzled or work-stealing tile assignment) rather than a 1:1 CTA-to-tile grid launch.
