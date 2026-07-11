@@ -990,6 +990,48 @@ __device__ void tmem_readout_to_smem_vec(
   }
 }
 
+// Same as tmem_readout_to_smem_vec, but stores bf16 (packed 2-per-store via
+// __nv_bfloat162) instead of fp32 — halves sS's smem footprint (Br*Bc*2 vs *4
+// bytes), which is what makes room for V18's double-buffered TMA staging.
+__device__ void tmem_readout_to_smem_bf16_vec(
+  __nv_bfloat16* smem_out,
+  uint32_t tmem_addr,
+  int M,
+  int N,
+  int smem_stride,
+  float scale
+){
+  asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+
+  const int warp_id = threadIdx.x / 32;
+  const int lane    = threadIdx.x % 32;
+  const int rows_per_warp = M / 4;
+  const uint32_t lane_base = (uint32_t)warp_id * 32u;
+  const int row = warp_id * rows_per_warp + lane;
+
+  for(int col = 0; col < N; col += 8){
+    uint32_t r0,r1,r2,r3,r4,r5,r6,r7;
+    asm volatile(
+      "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+      : "=r"(r0),"=r"(r1),"=r"(r2),"=r"(r3),"=r"(r4),"=r"(r5),"=r"(r6),"=r"(r7)
+      : "r"(tmem_addr + (lane_base << 16) + (uint32_t)col)
+      : "memory"
+    );
+    asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+    if(lane < rows_per_warp){
+      __nv_bfloat16* o = &smem_out[row * smem_stride + col];
+      *reinterpret_cast<__nv_bfloat162*>(&o[0]) = __floats2bfloat162_rn(
+          reinterpret_cast<float&>(r0) * scale, reinterpret_cast<float&>(r1) * scale);
+      *reinterpret_cast<__nv_bfloat162*>(&o[2]) = __floats2bfloat162_rn(
+          reinterpret_cast<float&>(r2) * scale, reinterpret_cast<float&>(r3) * scale);
+      *reinterpret_cast<__nv_bfloat162*>(&o[4]) = __floats2bfloat162_rn(
+          reinterpret_cast<float&>(r4) * scale, reinterpret_cast<float&>(r5) * scale);
+      *reinterpret_cast<__nv_bfloat162*>(&o[6]) = __floats2bfloat162_rn(
+          reinterpret_cast<float&>(r6) * scale, reinterpret_cast<float&>(r7) * scale);
+    }
+  }
+}
+
 template<int Br, int Bc, int D>
 __global__ void gqa_v4(
   __nv_bfloat16 *d_Q,
@@ -2593,6 +2635,1166 @@ __global__ void gqa_v12(
 
 } // end of v12
 
+// =================================
+//  V14 : V13 (V12 kernel @ Bc=128) + cluster launch scaffolding (Stage 4, step 1/3)
+// =================================
+// Identical body to gqa_v12; the ONLY change is __cluster_dims__(1,1,2): CTAs pair up
+// along gridDim.z, so a cluster = two adjacent q-tiles of the SAME (batch, head) —
+// both CTAs of a pair consume the identical K/V stream, which is what V15's multicast
+// and V16's cta_group::2 MMA build on. All tcgen05 ops stay cta_group::1 and all
+// buffers/sync stay CTA-local, so this isolates the pure cost/effect of clustered
+// scheduling (expected ~neutral). Grid divisibility: S/Br = 32 is even.
+template<int Br, int Bc, int D>
+__global__ void __cluster_dims__(1, 1, 2) gqa_v14(
+  __nv_bfloat16 *d_Q,
+  __nv_bfloat16 *d_O,
+  float *d_LSE,
+  const __grid_constant__ CUtensorMap Ktmap,   // K as flattened [B*Hkv*S, D]
+  const __grid_constant__ CUtensorMap Vtmap,   // V as flattened [B*Hkv*S, D]
+  int B,
+  int Hq,
+  int Hkv,
+  int G,
+  int S,
+  float scale
+){
+  const int b      = blockIdx.x;
+  const int hq     = blockIdx.y;
+  const int q_tile = blockIdx.z;
+  const int hkv    = hq / G;
+  const int tid    = threadIdx.x;
+
+  const int q_row0   = q_tile * Br;
+  const int nKVTiles = S / Bc;
+  const int kvRow0   = (b * Hkv + hkv) * S;   // first K/V row of this head in the flat tensor
+
+  const long qBase  = ((long)(b * Hq + hq) * S + q_row0) * D;
+  const long lBase  = ((long)(b * Hq + hq) * S + q_row0);
+
+  // Fold log2(e) into the score scale so QK^T lands in base-2 units (see V7 header).
+  const float scale_l2e = scale * 1.4426950408889634f;   // scale * float32 log2(e)
+
+  __shared__ __align__(16)  __nv_bfloat16 sQ[Br * D];
+  __shared__ __align__(128) __nv_bfloat16 sKstage[Bc * D];     // TMA target, row-major, SINGLE buffer
+  __shared__ __align__(128) __nv_bfloat16 sVstage[Bc * D];
+  __shared__ __align__(16)  __nv_bfloat16 sK[Bc * D];          // canonical K-major (reorder output)
+  __shared__ __align__(16)  __nv_bfloat16 sV[Bc * D];          // canonical [D,Bc] transposed
+  __shared__ __align__(16)  __nv_bfloat16 sP[Br * Bc];
+  __shared__ __align__(16)  float         sS[Br * Bc];
+  __shared__ __align__(16)  float         sO[Br * D];          // P@V readout accumulates here directly
+  __shared__ float sm[Br];
+  __shared__ float sl[Br];
+  __shared__ float sCorr[Br];
+  __shared__ __align__(8) uint64_t s_mma_bar;
+  __shared__ __align__(8) uint64_t s_load_bar;                 // single TMA completion barrier
+
+  for(int i = tid; i < Br * D; i += blockDim.x){
+    const int r = i / D, c = i % D;
+    sQ[canon_idx(r, c, Br)] = d_Q[qBase + i];
+    sO[i] = 0.0f;
+  }
+  if(tid < Br){ sm[tid] = -INFINITY; sl[tid] = 0.0f; }
+
+  const uint32_t mma_bar = (uint32_t)__cvta_generic_to_shared(&s_mma_bar);
+  const uint32_t lbar    = (uint32_t)__cvta_generic_to_shared(&s_load_bar);
+  if(tid == 0){ mbar_init(mma_bar, 1); mbar_init(lbar, 1); }
+  __syncthreads();
+
+  constexpr uint32_t NCOLS = (Bc > D) ? (uint32_t)Bc : (uint32_t)D;
+  static_assert(NCOLS >= 32 && (NCOLS & (NCOLS - 1)) == 0,
+                "tcgen05 column count must be a power of two >= 32");
+
+  uint32_t tmem_addr;
+  {
+    __shared__ uint32_t s_tmem_addr;
+    if(tid < 32){
+      uint32_t s_addr = (uint32_t)__cvta_generic_to_shared(&s_tmem_addr);
+      asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                   :: "r"(s_addr), "r"(NCOLS) : "memory");
+      asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    }
+    __syncthreads();
+    tmem_addr = s_tmem_addr;
+  }
+
+  int mbar_phase = 0;
+  int load_phase = 0;
+  const uint32_t TX = 2u * (uint32_t)Bc * (uint32_t)D * (uint32_t)sizeof(__nv_bfloat16); // K + V box bytes
+
+  const uint64_t descQ_base = make_smem_desc(sQ, Br);
+
+  for(int kc = 0; kc < nKVTiles; ++kc){
+    // TMA this tile into the single staging buffer (per-CTA, as V12/V13).
+    if(tid == 0){
+      const int r = kvRow0 + kc * Bc;
+      mbar_expect_tx(lbar, TX);
+      tma_load_2d((uint32_t)__cvta_generic_to_shared(sKstage), &Ktmap, 0, r, lbar);
+      tma_load_2d((uint32_t)__cvta_generic_to_shared(sVstage), &Vtmap, 0, r, lbar);
+      mbar_arrive(lbar);
+    }
+    mbar_wait(lbar, load_phase); load_phase ^= 1;
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    __syncthreads();
+
+    for(int i = tid; i < Bc * D; i += blockDim.x){
+      const int bc = i / D, d = i % D;
+      sK[canon_idx(bc, d, Bc)] = sKstage[i];   // K-major
+      sV[canon_idx(d, bc, D)]  = sVstage[i];   // transposed
+    }
+    __syncthreads();
+
+    // S2 = (Q @ K^T) * (scale*log2e) -> sS[Br, Bc]  (scores already in base-2 units)
+    {
+      const uint64_t descK_base = make_smem_desc(sK, Bc);
+      const uint32_t idesc      = make_idesc_bf16(Br, Bc);
+      if(tid == 0){
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        for(int kt = 0; kt < D/16; ++kt){
+          uint64_t descQ = advance_desc_katom(descQ_base, kt, Br);
+          uint64_t descK = advance_desc_katom(descK_base, kt, Bc);
+          uint32_t accumulate = (kt > 0) ? 1u : 0u;
+          asm volatile(
+            "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+            :: "r"(tmem_addr), "l"(descQ), "l"(descK), "r"(idesc), "r"(accumulate) : "memory");
+        }
+        mbar_commit_mma(mma_bar);
+      }
+      mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+      tmem_readout_to_smem_vec(sS, tmem_addr, Br, Bc, Bc, scale_l2e);   // prescale by log2e here
+      asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+      __syncthreads();
+    }
+
+    // online-softmax stats + unnormalized P, base-2 domain (exp2 via ex2.approx)
+    if(tid < Br){
+      const float m_old = sm[tid];
+      const float l_old = sl[tid];
+
+      // 3-way max tree over the row (fuses to FMNMX3 on sm_100+).
+      float tile_max = -INFINITY;
+      int j = 0;
+      for(; j + 2 < Bc; j += 3)
+        tile_max = fmaxf(tile_max,
+                         fmaxf(sS[tid * Bc + j],
+                               fmaxf(sS[tid * Bc + j + 1], sS[tid * Bc + j + 2])));
+      for(; j < Bc; ++j) tile_max = fmaxf(tile_max, sS[tid * Bc + j]);
+
+      const float m_new = fmaxf(m_old, tile_max);
+      const float corr  = ex2_approx(m_old - m_new);   // == exp(m_old - m_new)
+
+      // Pack two probabilities per F2FP (F2FP.BF16.F32.PACK_AB) + one 32-bit STS.
+      float p_sum = 0.0f;
+      for(int j2 = 0; j2 < Bc; j2 += 2){
+        const float p0 = ex2_approx(sS[tid * Bc + j2]     - m_new);   // == exp(S - m_new)
+        const float p1 = ex2_approx(sS[tid * Bc + j2 + 1] - m_new);
+        *reinterpret_cast<__nv_bfloat162*>(&sP[canon_idx(tid, j2, Br)]) =
+            __floats2bfloat162_rn(p0, p1);
+        p_sum += p0 + p1;
+      }
+      sm[tid] = m_new; sl[tid] = l_old * corr + p_sum; sCorr[tid] = corr;
+    }
+    __syncthreads();
+
+    for(int i = tid; i < Br * D; i += blockDim.x) sO[i] *= sCorr[i / D];
+    __syncthreads();
+
+    // O_tile = P @ V, readout ACCUMULATED straight into sO (no sPV staging).
+    {
+      const uint64_t descP_base = make_smem_desc(sP, Br);
+      const uint64_t descV_base = make_smem_desc(sV, D);
+      const uint32_t idesc      = make_idesc_bf16(Br, D);
+      if(tid == 0){
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        for(int kt = 0; kt < Bc/16; ++kt){
+          uint64_t descP = advance_desc_katom(descP_base, kt, Br);
+          uint64_t descV = advance_desc_katom(descV_base, kt, D);
+          uint32_t accumulate = (kt > 0) ? 1u : 0u;
+          asm volatile(
+            "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+            :: "r"(tmem_addr), "l"(descP), "l"(descV), "r"(idesc), "r"(accumulate) : "memory");
+        }
+        mbar_commit_mma(mma_bar);
+      }
+      mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+      tmem_readout_accum_vec(sO, tmem_addr, Br, D, D);   // sO += P@V, no staging hop
+      asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+      __syncthreads();
+    }
+  } // end kv loop
+
+  if(tid < 32)
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                 :: "r"(tmem_addr), "r"(NCOLS) : "memory");
+  __syncthreads();
+
+  // Normalize + write O, packing two columns per bf16x2 store (D even -> same row denom).
+  for(int i = 2 * tid; i < Br * D; i += 2 * blockDim.x){
+    const float denom = sl[i / D];
+    *reinterpret_cast<__nv_bfloat162*>(&d_O[qBase + i]) =
+        __floats2bfloat162_rn(sO[i] / denom, sO[i + 1] / denom);
+  }
+  if(tid < Br)
+    // m and l are in base-2 units: LSE_nat = ln2 * (m2 + log2(l)).
+    d_LSE[lBase + tid] = 0.6931471805599453f * (sm[tid] + log2f(sl[tid]));
+
+} // end of v14
+
+// =================================
+//  V15 : V14 + multicast K/V TMA (Stage 4, step 2/3)
+// =================================
+// The two CTAs of a cluster process adjacent q-tiles of the SAME head, so they need
+// the IDENTICAL K/V tile each iteration. Cluster rank 0 issues ONE multicast TMA per
+// K/V tile (ctaMask 0b11): the tile lands at the same smem offset in BOTH CTAs'
+// staging, and each CTA's own load mbarrier receives the transaction bytes. K/V HBM
+// requests halve. MMAs stay cta_group::1; reorder/compute stay CTA-local.
+// Sync protocol per tile:
+//   1. each CTA's tid0: expect_tx on its LOCAL barrier
+//   2. cluster.sync()  — REQUIRED: (a) WAR — rank0's multicast writes the PEER's
+//      staging, so the peer must be done reading it (prev reorder); (b) both expects
+//      are set before any completion bytes can arrive
+//   3. rank0 tid0 issues the two multicast TMAs
+//   4. each CTA's tid0: local arrive (its barrier counts 1 arrival + TX bytes)
+//   5. each CTA waits its local barrier, then proceeds CTA-locally as before
+__device__ __forceinline__ void tma_load_2d_mc(uint32_t smem_addr, const void* tmap,
+                                               int c, int r, uint32_t bar, uint16_t ctaMask){
+  asm volatile(
+    "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster"
+    " [%0], [%1, {%2, %3}], [%4], %5;"
+    :: "r"(smem_addr), "l"(tmap), "r"(c), "r"(r), "r"(bar), "h"(ctaMask) : "memory");
+}
+
+template<int Br, int Bc, int D>
+__global__ void __cluster_dims__(1, 1, 2) gqa_v15(
+  __nv_bfloat16 *d_Q,
+  __nv_bfloat16 *d_O,
+  float *d_LSE,
+  const __grid_constant__ CUtensorMap Ktmap,   // K as flattened [B*Hkv*S, D]
+  const __grid_constant__ CUtensorMap Vtmap,   // V as flattened [B*Hkv*S, D]
+  int B,
+  int Hq,
+  int Hkv,
+  int G,
+  int S,
+  float scale
+){
+  const int b      = blockIdx.x;
+  const int hq     = blockIdx.y;
+  const int q_tile = blockIdx.z;
+  const int hkv    = hq / G;
+  const int tid    = threadIdx.x;
+
+  cg::cluster_group cluster = cg::this_cluster();
+  const unsigned int crank  = cluster.block_rank();   // 0 or 1 within the pair
+
+  const int q_row0   = q_tile * Br;
+  const int nKVTiles = S / Bc;
+  const int kvRow0   = (b * Hkv + hkv) * S;   // identical for both CTAs of the cluster
+
+  const long qBase  = ((long)(b * Hq + hq) * S + q_row0) * D;
+  const long lBase  = ((long)(b * Hq + hq) * S + q_row0);
+
+  // Fold log2(e) into the score scale so QK^T lands in base-2 units (see V7 header).
+  const float scale_l2e = scale * 1.4426950408889634f;   // scale * float32 log2(e)
+
+  __shared__ __align__(16)  __nv_bfloat16 sQ[Br * D];
+  __shared__ __align__(128) __nv_bfloat16 sKstage[Bc * D];     // multicast TMA target (both CTAs)
+  __shared__ __align__(128) __nv_bfloat16 sVstage[Bc * D];
+  __shared__ __align__(16)  __nv_bfloat16 sK[Bc * D];          // canonical K-major (reorder output)
+  __shared__ __align__(16)  __nv_bfloat16 sV[Bc * D];          // canonical [D,Bc] transposed
+  __shared__ __align__(16)  __nv_bfloat16 sP[Br * Bc];
+  __shared__ __align__(16)  float         sS[Br * Bc];
+  __shared__ __align__(16)  float         sO[Br * D];          // P@V readout accumulates here directly
+  __shared__ float sm[Br];
+  __shared__ float sl[Br];
+  __shared__ float sCorr[Br];
+  __shared__ __align__(8) uint64_t s_mma_bar;
+  __shared__ __align__(8) uint64_t s_load_bar;                 // single TMA completion barrier
+
+  for(int i = tid; i < Br * D; i += blockDim.x){
+    const int r = i / D, c = i % D;
+    sQ[canon_idx(r, c, Br)] = d_Q[qBase + i];
+    sO[i] = 0.0f;
+  }
+  if(tid < Br){ sm[tid] = -INFINITY; sl[tid] = 0.0f; }
+
+  const uint32_t mma_bar = (uint32_t)__cvta_generic_to_shared(&s_mma_bar);
+  const uint32_t lbar    = (uint32_t)__cvta_generic_to_shared(&s_load_bar);
+  if(tid == 0){ mbar_init(mma_bar, 1); mbar_init(lbar, 1); }
+  __syncthreads();
+
+  constexpr uint32_t NCOLS = (Bc > D) ? (uint32_t)Bc : (uint32_t)D;
+  static_assert(NCOLS >= 32 && (NCOLS & (NCOLS - 1)) == 0,
+                "tcgen05 column count must be a power of two >= 32");
+
+  uint32_t tmem_addr;
+  {
+    __shared__ uint32_t s_tmem_addr;
+    if(tid < 32){
+      uint32_t s_addr = (uint32_t)__cvta_generic_to_shared(&s_tmem_addr);
+      asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                   :: "r"(s_addr), "r"(NCOLS) : "memory");
+      asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    }
+    __syncthreads();
+    tmem_addr = s_tmem_addr;
+  }
+
+  int mbar_phase = 0;
+  int load_phase = 0;
+  const uint32_t TX = 2u * (uint32_t)Bc * (uint32_t)D * (uint32_t)sizeof(__nv_bfloat16); // K + V box bytes
+
+  const uint64_t descQ_base = make_smem_desc(sQ, Br);
+
+  for(int kc = 0; kc < nKVTiles; ++kc){
+    // Multicast this K/V tile into BOTH CTAs' staging (see protocol in the header).
+    if(tid == 0) mbar_expect_tx(lbar, TX);
+    cluster.sync();
+    if(crank == 0 && tid == 0){
+      const int r = kvRow0 + kc * Bc;
+      tma_load_2d_mc((uint32_t)__cvta_generic_to_shared(sKstage), &Ktmap, 0, r, lbar, 0b11);
+      tma_load_2d_mc((uint32_t)__cvta_generic_to_shared(sVstage), &Vtmap, 0, r, lbar, 0b11);
+    }
+    if(tid == 0) mbar_arrive(lbar);
+    mbar_wait(lbar, load_phase); load_phase ^= 1;
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    __syncthreads();
+
+    for(int i = tid; i < Bc * D; i += blockDim.x){
+      const int bc = i / D, d = i % D;
+      sK[canon_idx(bc, d, Bc)] = sKstage[i];   // K-major
+      sV[canon_idx(d, bc, D)]  = sVstage[i];   // transposed
+    }
+    __syncthreads();
+
+    // S2 = (Q @ K^T) * (scale*log2e) -> sS[Br, Bc]  (scores already in base-2 units)
+    {
+      const uint64_t descK_base = make_smem_desc(sK, Bc);
+      const uint32_t idesc      = make_idesc_bf16(Br, Bc);
+      if(tid == 0){
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        for(int kt = 0; kt < D/16; ++kt){
+          uint64_t descQ = advance_desc_katom(descQ_base, kt, Br);
+          uint64_t descK = advance_desc_katom(descK_base, kt, Bc);
+          uint32_t accumulate = (kt > 0) ? 1u : 0u;
+          asm volatile(
+            "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+            :: "r"(tmem_addr), "l"(descQ), "l"(descK), "r"(idesc), "r"(accumulate) : "memory");
+        }
+        mbar_commit_mma(mma_bar);
+      }
+      mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+      tmem_readout_to_smem_vec(sS, tmem_addr, Br, Bc, Bc, scale_l2e);   // prescale by log2e here
+      asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+      __syncthreads();
+    }
+
+    // online-softmax stats + unnormalized P, base-2 domain (exp2 via ex2.approx)
+    if(tid < Br){
+      const float m_old = sm[tid];
+      const float l_old = sl[tid];
+
+      // 3-way max tree over the row (fuses to FMNMX3 on sm_100+).
+      float tile_max = -INFINITY;
+      int j = 0;
+      for(; j + 2 < Bc; j += 3)
+        tile_max = fmaxf(tile_max,
+                         fmaxf(sS[tid * Bc + j],
+                               fmaxf(sS[tid * Bc + j + 1], sS[tid * Bc + j + 2])));
+      for(; j < Bc; ++j) tile_max = fmaxf(tile_max, sS[tid * Bc + j]);
+
+      const float m_new = fmaxf(m_old, tile_max);
+      const float corr  = ex2_approx(m_old - m_new);   // == exp(m_old - m_new)
+
+      // Pack two probabilities per F2FP (F2FP.BF16.F32.PACK_AB) + one 32-bit STS.
+      float p_sum = 0.0f;
+      for(int j2 = 0; j2 < Bc; j2 += 2){
+        const float p0 = ex2_approx(sS[tid * Bc + j2]     - m_new);   // == exp(S - m_new)
+        const float p1 = ex2_approx(sS[tid * Bc + j2 + 1] - m_new);
+        *reinterpret_cast<__nv_bfloat162*>(&sP[canon_idx(tid, j2, Br)]) =
+            __floats2bfloat162_rn(p0, p1);
+        p_sum += p0 + p1;
+      }
+      sm[tid] = m_new; sl[tid] = l_old * corr + p_sum; sCorr[tid] = corr;
+    }
+    __syncthreads();
+
+    for(int i = tid; i < Br * D; i += blockDim.x) sO[i] *= sCorr[i / D];
+    __syncthreads();
+
+    // O_tile = P @ V, readout ACCUMULATED straight into sO (no sPV staging).
+    {
+      const uint64_t descP_base = make_smem_desc(sP, Br);
+      const uint64_t descV_base = make_smem_desc(sV, D);
+      const uint32_t idesc      = make_idesc_bf16(Br, D);
+      if(tid == 0){
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        for(int kt = 0; kt < Bc/16; ++kt){
+          uint64_t descP = advance_desc_katom(descP_base, kt, Br);
+          uint64_t descV = advance_desc_katom(descV_base, kt, D);
+          uint32_t accumulate = (kt > 0) ? 1u : 0u;
+          asm volatile(
+            "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+            :: "r"(tmem_addr), "l"(descP), "l"(descV), "r"(idesc), "r"(accumulate) : "memory");
+        }
+        mbar_commit_mma(mma_bar);
+      }
+      mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+      tmem_readout_accum_vec(sO, tmem_addr, Br, D, D);   // sO += P@V, no staging hop
+      asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+      __syncthreads();
+    }
+  } // end kv loop
+
+  // The multicast source (rank 0) must not exit while its peer might still have TMA
+  // traffic outstanding toward it; a final cluster sync keeps the pair's lifetimes tied.
+  cluster.sync();
+
+  if(tid < 32)
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                 :: "r"(tmem_addr), "r"(NCOLS) : "memory");
+  __syncthreads();
+
+  // Normalize + write O, packing two columns per bf16x2 store (D even -> same row denom).
+  for(int i = 2 * tid; i < Br * D; i += 2 * blockDim.x){
+    const float denom = sl[i / D];
+    *reinterpret_cast<__nv_bfloat162*>(&d_O[qBase + i]) =
+        __floats2bfloat162_rn(sO[i] / denom, sO[i + 1] / denom);
+  }
+  if(tid < Br)
+    // m and l are in base-2 units: LSE_nat = ln2 * (m2 + log2(l)).
+    d_LSE[lBase + tid] = 0.6931471805599453f * (sm[tid] + log2f(sl[tid]));
+
+} // end of v15
+
+// =================================
+//  V16 : V13 core + persistent kernel (Stage 5)
+// =================================
+// Stage-4 verdict: V14 (clustering) was free but V15 (multicast) regressed — the
+// pair's K/V reread was already an L2 hit, so cluster coupling cost more than it
+// saved. cta_group::2 was skipped on that evidence. V16 instead removes per-block
+// overhead with zero coupling: launch ONE resident CTA per SM and loop over work
+// items (b, hq, q_tile) with static striding (uniform cost per item — every item
+// sweeps the full S, so a dynamic atomic queue would only add contention).
+// Hoisted out of the work loop: TMEM alloc/dealloc, mbarrier inits, Q descriptor —
+// ~3072 per-block setups collapse to ~#SM. Work index order is b-fastest, then hq,
+// then q_tile, so concurrently-resident SMs share few distinct KV streams (all G
+// heads of one KV head adjacent) for L2 reuse. mbarrier parity phases simply keep
+// running across work items. One extra __syncthreads at the end of each work item
+// keeps the next item's sO=0 from racing the epilogue's sO reads.
+template<int Br, int Bc, int D>
+__global__ void gqa_v16(
+  __nv_bfloat16 *d_Q,
+  __nv_bfloat16 *d_O,
+  float *d_LSE,
+  const __grid_constant__ CUtensorMap Ktmap,   // K as flattened [B*Hkv*S, D]
+  const __grid_constant__ CUtensorMap Vtmap,   // V as flattened [B*Hkv*S, D]
+  int B,
+  int Hq,
+  int Hkv,
+  int G,
+  int S,
+  float scale
+){
+  const int tid       = threadIdx.x;
+  const int nKVTiles  = S / Bc;
+  const int totalWork = B * Hq * (S / Br);   // one item = one (b, hq, q_tile)
+
+  // Fold log2(e) into the score scale so QK^T lands in base-2 units (see V7 header).
+  const float scale_l2e = scale * 1.4426950408889634f;   // scale * float32 log2(e)
+
+  __shared__ __align__(16)  __nv_bfloat16 sQ[Br * D];
+  __shared__ __align__(128) __nv_bfloat16 sKstage[Bc * D];     // TMA target, row-major, SINGLE buffer
+  __shared__ __align__(128) __nv_bfloat16 sVstage[Bc * D];
+  __shared__ __align__(16)  __nv_bfloat16 sK[Bc * D];          // canonical K-major (reorder output)
+  __shared__ __align__(16)  __nv_bfloat16 sV[Bc * D];          // canonical [D,Bc] transposed
+  __shared__ __align__(16)  __nv_bfloat16 sP[Br * Bc];
+  __shared__ __align__(16)  float         sS[Br * Bc];
+  __shared__ __align__(16)  float         sO[Br * D];          // P@V readout accumulates here directly
+  __shared__ float sm[Br];
+  __shared__ float sl[Br];
+  __shared__ float sCorr[Br];
+  __shared__ __align__(8) uint64_t s_mma_bar;
+  __shared__ __align__(8) uint64_t s_load_bar;                 // single TMA completion barrier
+
+  // ---- One-time per-block setup (was per-tile-of-work in V13) ----
+  const uint32_t mma_bar = (uint32_t)__cvta_generic_to_shared(&s_mma_bar);
+  const uint32_t lbar    = (uint32_t)__cvta_generic_to_shared(&s_load_bar);
+  if(tid == 0){ mbar_init(mma_bar, 1); mbar_init(lbar, 1); }
+  __syncthreads();
+
+  constexpr uint32_t NCOLS = (Bc > D) ? (uint32_t)Bc : (uint32_t)D;
+  static_assert(NCOLS >= 32 && (NCOLS & (NCOLS - 1)) == 0,
+                "tcgen05 column count must be a power of two >= 32");
+
+  uint32_t tmem_addr;
+  {
+    __shared__ uint32_t s_tmem_addr;
+    if(tid < 32){
+      uint32_t s_addr = (uint32_t)__cvta_generic_to_shared(&s_tmem_addr);
+      asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                   :: "r"(s_addr), "r"(NCOLS) : "memory");
+      asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    }
+    __syncthreads();
+    tmem_addr = s_tmem_addr;
+  }
+
+  int mbar_phase = 0;   // parity phases persist across work items
+  int load_phase = 0;
+  const uint32_t TX = 2u * (uint32_t)Bc * (uint32_t)D * (uint32_t)sizeof(__nv_bfloat16); // K + V box bytes
+
+  const uint64_t descQ_base = make_smem_desc(sQ, Br);   // sQ address is fixed -> hoisted
+
+  // ---- Persistent work loop: b fastest, then hq, then q_tile (L2-friendly) ----
+  for(int w = blockIdx.x; w < totalWork; w += gridDim.x){
+    const int b      = w % B;
+    const int hq     = (w / B) % Hq;
+    const int q_tile = w / (B * Hq);
+    const int hkv    = hq / G;
+
+    const int q_row0 = q_tile * Br;
+    const int kvRow0 = (b * Hkv + hkv) * S;
+
+    const long qBase = ((long)(b * Hq + hq) * S + q_row0) * D;
+    const long lBase = ((long)(b * Hq + hq) * S + q_row0);
+
+    // Per-work-item state init (prior item's epilogue finished: barrier at loop end).
+    for(int i = tid; i < Br * D; i += blockDim.x){
+      const int r = i / D, c = i % D;
+      sQ[canon_idx(r, c, Br)] = d_Q[qBase + i];
+      sO[i] = 0.0f;
+    }
+    if(tid < Br){ sm[tid] = -INFINITY; sl[tid] = 0.0f; }
+    __syncthreads();
+
+    for(int kc = 0; kc < nKVTiles; ++kc){
+      // TMA this tile into the single staging buffer.
+      if(tid == 0){
+        const int r = kvRow0 + kc * Bc;
+        mbar_expect_tx(lbar, TX);
+        tma_load_2d((uint32_t)__cvta_generic_to_shared(sKstage), &Ktmap, 0, r, lbar);
+        tma_load_2d((uint32_t)__cvta_generic_to_shared(sVstage), &Vtmap, 0, r, lbar);
+        mbar_arrive(lbar);
+      }
+      mbar_wait(lbar, load_phase); load_phase ^= 1;
+      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+      __syncthreads();
+
+      for(int i = tid; i < Bc * D; i += blockDim.x){
+        const int bc = i / D, d = i % D;
+        sK[canon_idx(bc, d, Bc)] = sKstage[i];   // K-major
+        sV[canon_idx(d, bc, D)]  = sVstage[i];   // transposed
+      }
+      __syncthreads();
+
+      // S2 = (Q @ K^T) * (scale*log2e) -> sS[Br, Bc]  (scores already in base-2 units)
+      {
+        const uint64_t descK_base = make_smem_desc(sK, Bc);
+        const uint32_t idesc      = make_idesc_bf16(Br, Bc);
+        if(tid == 0){
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          for(int kt = 0; kt < D/16; ++kt){
+            uint64_t descQ = advance_desc_katom(descQ_base, kt, Br);
+            uint64_t descK = advance_desc_katom(descK_base, kt, Bc);
+            uint32_t accumulate = (kt > 0) ? 1u : 0u;
+            asm volatile(
+              "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+              :: "r"(tmem_addr), "l"(descQ), "l"(descK), "r"(idesc), "r"(accumulate) : "memory");
+          }
+          mbar_commit_mma(mma_bar);
+        }
+        mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+        tmem_readout_to_smem_vec(sS, tmem_addr, Br, Bc, Bc, scale_l2e);   // prescale by log2e here
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        __syncthreads();
+      }
+
+      // online-softmax stats + unnormalized P, base-2 domain (exp2 via ex2.approx)
+      if(tid < Br){
+        const float m_old = sm[tid];
+        const float l_old = sl[tid];
+
+        // 3-way max tree over the row (fuses to FMNMX3 on sm_100+).
+        float tile_max = -INFINITY;
+        int j = 0;
+        for(; j + 2 < Bc; j += 3)
+          tile_max = fmaxf(tile_max,
+                           fmaxf(sS[tid * Bc + j],
+                                 fmaxf(sS[tid * Bc + j + 1], sS[tid * Bc + j + 2])));
+        for(; j < Bc; ++j) tile_max = fmaxf(tile_max, sS[tid * Bc + j]);
+
+        const float m_new = fmaxf(m_old, tile_max);
+        const float corr  = ex2_approx(m_old - m_new);   // == exp(m_old - m_new)
+
+        // Pack two probabilities per F2FP (F2FP.BF16.F32.PACK_AB) + one 32-bit STS.
+        float p_sum = 0.0f;
+        for(int j2 = 0; j2 < Bc; j2 += 2){
+          const float p0 = ex2_approx(sS[tid * Bc + j2]     - m_new);   // == exp(S - m_new)
+          const float p1 = ex2_approx(sS[tid * Bc + j2 + 1] - m_new);
+          *reinterpret_cast<__nv_bfloat162*>(&sP[canon_idx(tid, j2, Br)]) =
+              __floats2bfloat162_rn(p0, p1);
+          p_sum += p0 + p1;
+        }
+        sm[tid] = m_new; sl[tid] = l_old * corr + p_sum; sCorr[tid] = corr;
+      }
+      __syncthreads();
+
+      for(int i = tid; i < Br * D; i += blockDim.x) sO[i] *= sCorr[i / D];
+      __syncthreads();
+
+      // O_tile = P @ V, readout ACCUMULATED straight into sO (no sPV staging).
+      {
+        const uint64_t descP_base = make_smem_desc(sP, Br);
+        const uint64_t descV_base = make_smem_desc(sV, D);
+        const uint32_t idesc      = make_idesc_bf16(Br, D);
+        if(tid == 0){
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          for(int kt = 0; kt < Bc/16; ++kt){
+            uint64_t descP = advance_desc_katom(descP_base, kt, Br);
+            uint64_t descV = advance_desc_katom(descV_base, kt, D);
+            uint32_t accumulate = (kt > 0) ? 1u : 0u;
+            asm volatile(
+              "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+              :: "r"(tmem_addr), "l"(descP), "l"(descV), "r"(idesc), "r"(accumulate) : "memory");
+          }
+          mbar_commit_mma(mma_bar);
+        }
+        mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+        tmem_readout_accum_vec(sO, tmem_addr, Br, D, D);   // sO += P@V, no staging hop
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        __syncthreads();
+      }
+    } // end kv loop
+
+    // Epilogue for this work item: normalize + write O (packed) and LSE.
+    for(int i = 2 * tid; i < Br * D; i += 2 * blockDim.x){
+      const float denom = sl[i / D];
+      *reinterpret_cast<__nv_bfloat162*>(&d_O[qBase + i]) =
+          __floats2bfloat162_rn(sO[i] / denom, sO[i + 1] / denom);
+    }
+    if(tid < Br)
+      // m and l are in base-2 units: LSE_nat = ln2 * (m2 + log2(l)).
+      d_LSE[lBase + tid] = 0.6931471805599453f * (sm[tid] + log2f(sl[tid]));
+
+    // Next item's sQ/sO writes must not race this epilogue's sO/sm/sl reads.
+    __syncthreads();
+  } // end persistent work loop
+
+  if(tid < 32)
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                 :: "r"(tmem_addr), "r"(NCOLS) : "memory");
+
+} // end of v16
+
+// =================================
+//  V17 : V13 core + warp specialization (Stage 6, step 1)
+// =================================
+// First warp-specialized version. V13 (and every kernel before it) is bulk-synchronous:
+// the whole 128-thread block issues the TMA load, then ALL threads sit in mbar_wait for
+// it, then ALL threads reorder/MMA/softmax/PV — so the TMA latency for tile kc is fully
+// on the critical path every iteration, never overlapped with kc's own compute.
+//
+// V17 adds a 5th warp (threads 128..159) whose ONLY job is issuing the K/V TMA loads —
+// a dedicated "producer" warp, decoupled from the 4 "consumer" warps (threads 0..127,
+// unchanged from V13/gqa_v12: same tid, same TMEM-readout warp mapping, same math).
+// Producer and consumer talk through two mbarriers instead of a block-wide __syncthreads:
+//   s_load_bar : producer -> consumer  ("tile kc's bytes are in sKstage/sVstage")
+//   s_free_bar : consumer -> producer  ("sKstage/sVstage are free, load kc+1")
+// The consumer arrives s_free_bar right after the reorder copy drains the staging
+// buffer into canonical sK/sV — BEFORE the QK^T MMA, softmax, and P@V for that tile even
+// start. So the producer's TMA for kc+1 runs concurrently with the consumer's MMA/softmax/
+// PV for kc, hiding TMA latency behind tensor-core + SIMT work instead of paying for it
+// serially. The staging buffer itself stays SINGLE-buffered (same smem footprint as V13,
+// still 1 CTA/SM) — the overlap comes purely from decoupling the wait, not from adding a
+// second buffer (that's V18).
+//
+// Consumer threads (0..127) synchronize with each other via a NAMED barrier (`bar.sync 1,
+// 128`) instead of `__syncthreads()`, since __syncthreads() would also block on the
+// producer warp (which must be free to run ahead). The producer warp never touches that
+// barrier id. Only the one-time setup (smem/mbarrier init, TMEM alloc/dealloc) and the
+// final epilogue use a real block-wide __syncthreads() (all 160 threads).
+__device__ __forceinline__ void consumer_sync(){
+  asm volatile("bar.sync 1, 128;" ::: "memory");
+}
+
+template<int Br, int Bc, int D>
+__global__ void gqa_v17(
+  __nv_bfloat16 *d_Q,
+  __nv_bfloat16 *d_O,
+  float *d_LSE,
+  const __grid_constant__ CUtensorMap Ktmap,   // K as flattened [B*Hkv*S, D]
+  const __grid_constant__ CUtensorMap Vtmap,   // V as flattened [B*Hkv*S, D]
+  int B,
+  int Hq,
+  int Hkv,
+  int G,
+  int S,
+  float scale
+){
+  static_assert(Br == 128, "V17's consumer group is hardwired to 128 threads (TMEM readout needs warps 0-3)");
+
+  const int b      = blockIdx.x;
+  const int hq     = blockIdx.y;
+  const int q_tile = blockIdx.z;
+  const int hkv    = hq / G;
+  const int tid    = threadIdx.x;              // 0..159: 0..127 consumer, 128..159 producer
+
+  const int q_row0   = q_tile * Br;
+  const int nKVTiles = S / Bc;
+  const int kvRow0   = (b * Hkv + hkv) * S;   // first K/V row of this head in the flat tensor
+
+  const long qBase  = ((long)(b * Hq + hq) * S + q_row0) * D;
+  const long lBase  = ((long)(b * Hq + hq) * S + q_row0);
+
+  // Fold log2(e) into the score scale so QK^T lands in base-2 units (see V7 header).
+  const float scale_l2e = scale * 1.4426950408889634f;   // scale * float32 log2(e)
+
+  __shared__ __align__(16)  __nv_bfloat16 sQ[Br * D];
+  __shared__ __align__(128) __nv_bfloat16 sKstage[Bc * D];     // TMA target, row-major, SINGLE buffer
+  __shared__ __align__(128) __nv_bfloat16 sVstage[Bc * D];
+  __shared__ __align__(16)  __nv_bfloat16 sK[Bc * D];          // canonical K-major (reorder output)
+  __shared__ __align__(16)  __nv_bfloat16 sV[Bc * D];          // canonical [D,Bc] transposed
+  __shared__ __align__(16)  __nv_bfloat16 sP[Br * Bc];
+  __shared__ __align__(16)  float         sS[Br * Bc];
+  __shared__ __align__(16)  float         sO[Br * D];          // P@V readout accumulates here directly
+  __shared__ float sm[Br];
+  __shared__ float sl[Br];
+  __shared__ float sCorr[Br];
+  __shared__ __align__(8) uint64_t s_mma_bar;
+  __shared__ __align__(8) uint64_t s_load_bar;   // producer -> consumer: tile bytes ready
+  __shared__ __align__(8) uint64_t s_free_bar;   // consumer -> producer: staging buffer free
+
+  for(int i = tid; i < Br * D; i += blockDim.x){
+    const int r = i / D, c = i % D;
+    sQ[canon_idx(r, c, Br)] = d_Q[qBase + i];
+    sO[i] = 0.0f;
+  }
+  if(tid < Br){ sm[tid] = -INFINITY; sl[tid] = 0.0f; }
+
+  const uint32_t mma_bar  = (uint32_t)__cvta_generic_to_shared(&s_mma_bar);
+  const uint32_t lbar     = (uint32_t)__cvta_generic_to_shared(&s_load_bar);
+  const uint32_t fbar     = (uint32_t)__cvta_generic_to_shared(&s_free_bar);
+  if(tid == 0){ mbar_init(mma_bar, 1); mbar_init(lbar, 1); mbar_init(fbar, 1); }
+  __syncthreads();
+
+  constexpr uint32_t NCOLS = (Bc > D) ? (uint32_t)Bc : (uint32_t)D;
+  static_assert(NCOLS >= 32 && (NCOLS & (NCOLS - 1)) == 0,
+                "tcgen05 column count must be a power of two >= 32");
+
+  uint32_t tmem_addr;
+  {
+    __shared__ uint32_t s_tmem_addr;
+    if(tid < 32){
+      uint32_t s_addr = (uint32_t)__cvta_generic_to_shared(&s_tmem_addr);
+      asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                   :: "r"(s_addr), "r"(NCOLS) : "memory");
+      asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    }
+    __syncthreads();
+    tmem_addr = s_tmem_addr;
+  }
+
+  const uint32_t TX = 2u * (uint32_t)Bc * (uint32_t)D * (uint32_t)sizeof(__nv_bfloat16); // K + V box bytes
+  const uint32_t sKstage_addr = (uint32_t)__cvta_generic_to_shared(sKstage);
+  const uint32_t sVstage_addr = (uint32_t)__cvta_generic_to_shared(sVstage);
+
+  if(tid >= 128){
+    // ---- Producer warp: only issues TMA loads, runs ahead of the consumers. ----
+    if(tid == 128){
+      int free_phase = 0;
+      for(int kc = 0; kc < nKVTiles; ++kc){
+        if(kc > 0){ mbar_wait(fbar, free_phase); free_phase ^= 1; }
+        const int r = kvRow0 + kc * Bc;
+        mbar_expect_tx(lbar, TX);
+        tma_load_2d(sKstage_addr, &Ktmap, 0, r, lbar);
+        tma_load_2d(sVstage_addr, &Vtmap, 0, r, lbar);
+        mbar_arrive(lbar);
+      }
+    }
+  } else {
+    // ---- Consumer warps (0-3): reorder + MMA-issue + softmax + PV, unchanged from V13. ----
+    int mbar_phase = 0;
+    int load_phase = 0;
+    const uint64_t descQ_base = make_smem_desc(sQ, Br);
+
+    for(int kc = 0; kc < nKVTiles; ++kc){
+      mbar_wait(lbar, load_phase); load_phase ^= 1;
+      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+      consumer_sync();
+
+      for(int i = tid; i < Bc * D; i += Br){
+        const int bc = i / D, d = i % D;
+        sK[canon_idx(bc, d, Bc)] = sKstage[i];   // K-major
+        sV[canon_idx(d, bc, D)]  = sVstage[i];   // transposed
+      }
+      consumer_sync();
+      // Staging buffer fully drained into canonical sK/sV — let the producer reuse it
+      // for kc+1 while this iteration's MMA/softmax/PV run.
+      if(tid == 0) mbar_arrive(fbar);
+
+      // S2 = (Q @ K^T) * (scale*log2e) -> sS[Br, Bc]  (scores already in base-2 units)
+      {
+        const uint64_t descK_base = make_smem_desc(sK, Bc);
+        const uint32_t idesc      = make_idesc_bf16(Br, Bc);
+        if(tid == 0){
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          for(int kt = 0; kt < D/16; ++kt){
+            uint64_t descQ = advance_desc_katom(descQ_base, kt, Br);
+            uint64_t descK = advance_desc_katom(descK_base, kt, Bc);
+            uint32_t accumulate = (kt > 0) ? 1u : 0u;
+            asm volatile(
+              "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+              :: "r"(tmem_addr), "l"(descQ), "l"(descK), "r"(idesc), "r"(accumulate) : "memory");
+          }
+          mbar_commit_mma(mma_bar);
+        }
+        mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+        tmem_readout_to_smem_vec(sS, tmem_addr, Br, Bc, Bc, scale_l2e);   // prescale by log2e here
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        consumer_sync();
+      }
+
+      // online-softmax stats + unnormalized P, base-2 domain (exp2 via ex2.approx)
+      {
+        const float m_old = sm[tid];
+        const float l_old = sl[tid];
+
+        // 3-way max tree over the row (fuses to FMNMX3 on sm_100+).
+        float tile_max = -INFINITY;
+        int j = 0;
+        for(; j + 2 < Bc; j += 3)
+          tile_max = fmaxf(tile_max,
+                           fmaxf(sS[tid * Bc + j],
+                                 fmaxf(sS[tid * Bc + j + 1], sS[tid * Bc + j + 2])));
+        for(; j < Bc; ++j) tile_max = fmaxf(tile_max, sS[tid * Bc + j]);
+
+        const float m_new = fmaxf(m_old, tile_max);
+        const float corr  = ex2_approx(m_old - m_new);   // == exp(m_old - m_new)
+
+        // Pack two probabilities per F2FP (F2FP.BF16.F32.PACK_AB) + one 32-bit STS.
+        float p_sum = 0.0f;
+        for(int j2 = 0; j2 < Bc; j2 += 2){
+          const float p0 = ex2_approx(sS[tid * Bc + j2]     - m_new);   // == exp(S - m_new)
+          const float p1 = ex2_approx(sS[tid * Bc + j2 + 1] - m_new);
+          *reinterpret_cast<__nv_bfloat162*>(&sP[canon_idx(tid, j2, Br)]) =
+              __floats2bfloat162_rn(p0, p1);
+          p_sum += p0 + p1;
+        }
+        sm[tid] = m_new; sl[tid] = l_old * corr + p_sum; sCorr[tid] = corr;
+      }
+      consumer_sync();
+
+      for(int i = tid; i < Br * D; i += Br) sO[i] *= sCorr[i / D];
+      consumer_sync();
+
+      // O_tile = P @ V, readout ACCUMULATED straight into sO (no sPV staging).
+      {
+        const uint64_t descP_base = make_smem_desc(sP, Br);
+        const uint64_t descV_base = make_smem_desc(sV, D);
+        const uint32_t idesc      = make_idesc_bf16(Br, D);
+        if(tid == 0){
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          for(int kt = 0; kt < Bc/16; ++kt){
+            uint64_t descP = advance_desc_katom(descP_base, kt, Br);
+            uint64_t descV = advance_desc_katom(descV_base, kt, D);
+            uint32_t accumulate = (kt > 0) ? 1u : 0u;
+            asm volatile(
+              "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+              :: "r"(tmem_addr), "l"(descP), "l"(descV), "r"(idesc), "r"(accumulate) : "memory");
+          }
+          mbar_commit_mma(mma_bar);
+        }
+        mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+        tmem_readout_accum_vec(sO, tmem_addr, Br, D, D);   // sO += P@V, no staging hop
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        consumer_sync();
+      }
+    } // end kv loop
+  }
+
+  __syncthreads();   // full-block reconvergence: producer is done, consumers are done
+
+  if(tid < 32)
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                 :: "r"(tmem_addr), "r"(NCOLS) : "memory");
+
+  // Normalize + write O, packing two columns per bf16x2 store (D even -> same row denom).
+  for(int i = 2 * tid; i < Br * D; i += 2 * blockDim.x){
+    const float denom = sl[i / D];
+    *reinterpret_cast<__nv_bfloat162*>(&d_O[qBase + i]) =
+        __floats2bfloat162_rn(sO[i] / denom, sO[i + 1] / denom);
+  }
+  if(tid < Br)
+    // m and l are in base-2 units: LSE_nat = ln2 * (m2 + log2(l)).
+    d_LSE[lBase + tid] = 0.6931471805599453f * (sm[tid] + log2f(sl[tid]));
+
+} // end of v17
+
+// =================================
+//  V18 : V17 + double-buffered TMA staging (Stage 6, step 2)
+// =================================
+// V17 decoupled the TMA wait from the block-wide barrier but the staging buffer was
+// still SINGLE-buffered: the producer could only start loading tile kc+1 once the
+// consumer finished the *reorder* of tile kc (early in the iteration), giving ~1
+// iteration's worth of MMA/softmax/PV time to hide the TMA. V18 gives the producer a
+// full second slot (ping-pong sKstage/sVstage) so it can issue kc+1's load the instant
+// kc's slot is reordered out, with a whole extra iteration of headroom before the
+// consumer can possibly stall on it — a deeper, more forgiving pipeline.
+//
+// Shared-memory cost: doubling sKstage+sVstage costs +32KB, which does NOT fit next to
+// V13/V17's fp32 sS (Br*Bc*4 = 64KB) under sm_103a's static-smem ceiling (measured
+// empirically: 0x38c00 = 226KB max per block; V17 already uses ~209KB, leaving ~17KB —
+// not enough for +32KB). Fix: sS is stored as bf16 instead of fp32 (32KB instead of
+// 64KB, via tmem_readout_to_smem_bf16_vec), freeing exactly enough room —
+// measured total ~210.5KB, comfortably under the 226KB ceiling. This trades a little
+// precision on the pre-softmax scores (they were already headed into bf16-packed sP
+// one step later) for the smem headroom; correctness is checked against PyTorch SDPA
+// with the same tolerance as every other version below.
+//
+// No distributed-shared-memory/cluster fallback was needed for this step — flagging it
+// per the plan: DSM (V14/V15-style CTA pairing) is the fallback if a future version
+// needs MORE than this and the bf16-sS trick alone doesn't cover it.
+template<int Br, int Bc, int D>
+__global__ void gqa_v18(
+  __nv_bfloat16 *d_Q,
+  __nv_bfloat16 *d_O,
+  float *d_LSE,
+  const __grid_constant__ CUtensorMap Ktmap,   // K as flattened [B*Hkv*S, D]
+  const __grid_constant__ CUtensorMap Vtmap,   // V as flattened [B*Hkv*S, D]
+  int B,
+  int Hq,
+  int Hkv,
+  int G,
+  int S,
+  float scale
+){
+  static_assert(Br == 128, "V18's consumer group is hardwired to 128 threads (TMEM readout needs warps 0-3)");
+
+  const int b      = blockIdx.x;
+  const int hq     = blockIdx.y;
+  const int q_tile = blockIdx.z;
+  const int hkv    = hq / G;
+  const int tid    = threadIdx.x;              // 0..159: 0..127 consumer, 128..159 producer
+
+  const int q_row0   = q_tile * Br;
+  const int nKVTiles = S / Bc;
+  const int kvRow0   = (b * Hkv + hkv) * S;   // first K/V row of this head in the flat tensor
+
+  const long qBase  = ((long)(b * Hq + hq) * S + q_row0) * D;
+  const long lBase  = ((long)(b * Hq + hq) * S + q_row0);
+
+  // Fold log2(e) into the score scale so QK^T lands in base-2 units (see V7 header).
+  const float scale_l2e = scale * 1.4426950408889634f;   // scale * float32 log2(e)
+
+  __shared__ __align__(16)  __nv_bfloat16 sQ[Br * D];
+  __shared__ __align__(128) __nv_bfloat16 sKstage[2][Bc * D];   // TMA target, row-major, DOUBLE buffer
+  __shared__ __align__(128) __nv_bfloat16 sVstage[2][Bc * D];
+  __shared__ __align__(16)  __nv_bfloat16 sK[Bc * D];           // canonical K-major (reorder output)
+  __shared__ __align__(16)  __nv_bfloat16 sV[Bc * D];           // canonical [D,Bc] transposed
+  __shared__ __align__(16)  __nv_bfloat16 sP[Br * Bc];
+  __shared__ __align__(16)  __nv_bfloat16 sS[Br * Bc];          // bf16, not fp32 — see header
+  __shared__ __align__(16)  float         sO[Br * D];           // P@V readout accumulates here directly
+  __shared__ float sm[Br];
+  __shared__ float sl[Br];
+  __shared__ float sCorr[Br];
+  __shared__ __align__(8) uint64_t s_mma_bar;
+  __shared__ __align__(8) uint64_t s_load_bar[2];   // producer -> consumer: slot's bytes ready
+  __shared__ __align__(8) uint64_t s_free_bar[2];   // consumer -> producer: slot is free
+
+  for(int i = tid; i < Br * D; i += blockDim.x){
+    const int r = i / D, c = i % D;
+    sQ[canon_idx(r, c, Br)] = d_Q[qBase + i];
+    sO[i] = 0.0f;
+  }
+  if(tid < Br){ sm[tid] = -INFINITY; sl[tid] = 0.0f; }
+
+  const uint32_t mma_bar = (uint32_t)__cvta_generic_to_shared(&s_mma_bar);
+  const uint32_t lbar0   = (uint32_t)__cvta_generic_to_shared(&s_load_bar[0]);
+  const uint32_t lbar1   = (uint32_t)__cvta_generic_to_shared(&s_load_bar[1]);
+  const uint32_t fbar0   = (uint32_t)__cvta_generic_to_shared(&s_free_bar[0]);
+  const uint32_t fbar1   = (uint32_t)__cvta_generic_to_shared(&s_free_bar[1]);
+  if(tid == 0){
+    mbar_init(mma_bar, 1);
+    mbar_init(lbar0, 1); mbar_init(lbar1, 1);
+    mbar_init(fbar0, 1); mbar_init(fbar1, 1);
+  }
+  __syncthreads();
+
+  constexpr uint32_t NCOLS = (Bc > D) ? (uint32_t)Bc : (uint32_t)D;
+  static_assert(NCOLS >= 32 && (NCOLS & (NCOLS - 1)) == 0,
+                "tcgen05 column count must be a power of two >= 32");
+
+  uint32_t tmem_addr;
+  {
+    __shared__ uint32_t s_tmem_addr;
+    if(tid < 32){
+      uint32_t s_addr = (uint32_t)__cvta_generic_to_shared(&s_tmem_addr);
+      asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                   :: "r"(s_addr), "r"(NCOLS) : "memory");
+      asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    }
+    __syncthreads();
+    tmem_addr = s_tmem_addr;
+  }
+
+  const uint32_t TX = 2u * (uint32_t)Bc * (uint32_t)D * (uint32_t)sizeof(__nv_bfloat16); // K + V box bytes
+  const uint32_t sKstage_addr[2] = {
+    (uint32_t)__cvta_generic_to_shared(sKstage[0]),
+    (uint32_t)__cvta_generic_to_shared(sKstage[1])
+  };
+  const uint32_t sVstage_addr[2] = {
+    (uint32_t)__cvta_generic_to_shared(sVstage[0]),
+    (uint32_t)__cvta_generic_to_shared(sVstage[1])
+  };
+  const uint32_t lbar[2] = {lbar0, lbar1};
+  const uint32_t fbar[2] = {fbar0, fbar1};
+
+  if(tid >= 128){
+    // ---- Producer warp: fills both slots ahead of the consumers. ----
+    if(tid == 128){
+      int free_phase[2] = {0, 0};
+      for(int kc = 0; kc < nKVTiles; ++kc){
+        const int slot = kc & 1;
+        // Slots 0 and 1 start empty, so the first wait for each is at kc == slot+2.
+        if(kc >= 2){ mbar_wait(fbar[slot], free_phase[slot]); free_phase[slot] ^= 1; }
+        const int r = kvRow0 + kc * Bc;
+        mbar_expect_tx(lbar[slot], TX);
+        tma_load_2d(sKstage_addr[slot], &Ktmap, 0, r, lbar[slot]);
+        tma_load_2d(sVstage_addr[slot], &Vtmap, 0, r, lbar[slot]);
+        mbar_arrive(lbar[slot]);
+      }
+    }
+  } else {
+    // ---- Consumer warps (0-3): reorder + MMA-issue + softmax + PV. ----
+    int mbar_phase = 0;
+    int load_phase[2] = {0, 0};
+    const uint64_t descQ_base = make_smem_desc(sQ, Br);
+
+    for(int kc = 0; kc < nKVTiles; ++kc){
+      const int slot = kc & 1;
+      mbar_wait(lbar[slot], load_phase[slot]); load_phase[slot] ^= 1;
+      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+      consumer_sync();
+
+      for(int i = tid; i < Bc * D; i += Br){
+        const int bc = i / D, d = i % D;
+        sK[canon_idx(bc, d, Bc)] = sKstage[slot][i];   // K-major
+        sV[canon_idx(d, bc, D)]  = sVstage[slot][i];   // transposed
+      }
+      consumer_sync();
+      // This slot is fully drained into canonical sK/sV — let the producer reuse it
+      // two tiles from now, while this iteration's MMA/softmax/PV run.
+      if(tid == 0) mbar_arrive(fbar[slot]);
+
+      // S2 = (Q @ K^T) * (scale*log2e) -> sS[Br, Bc], bf16 (scores already in base-2 units)
+      {
+        const uint64_t descK_base = make_smem_desc(sK, Bc);
+        const uint32_t idesc      = make_idesc_bf16(Br, Bc);
+        if(tid == 0){
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          for(int kt = 0; kt < D/16; ++kt){
+            uint64_t descQ = advance_desc_katom(descQ_base, kt, Br);
+            uint64_t descK = advance_desc_katom(descK_base, kt, Bc);
+            uint32_t accumulate = (kt > 0) ? 1u : 0u;
+            asm volatile(
+              "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+              :: "r"(tmem_addr), "l"(descQ), "l"(descK), "r"(idesc), "r"(accumulate) : "memory");
+          }
+          mbar_commit_mma(mma_bar);
+        }
+        mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+        tmem_readout_to_smem_bf16_vec(sS, tmem_addr, Br, Bc, Bc, scale_l2e);   // prescale by log2e here
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        consumer_sync();
+      }
+
+      // online-softmax stats + unnormalized P, base-2 domain (exp2 via ex2.approx)
+      {
+        const float m_old = sm[tid];
+        const float l_old = sl[tid];
+
+        // 3-way max tree over the row (fuses to FMNMX3 on sm_100+).
+        float tile_max = -INFINITY;
+        int j = 0;
+        for(; j + 2 < Bc; j += 3)
+          tile_max = fmaxf(tile_max,
+                           fmaxf(__bfloat162float(sS[tid * Bc + j]),
+                                 fmaxf(__bfloat162float(sS[tid * Bc + j + 1]),
+                                       __bfloat162float(sS[tid * Bc + j + 2]))));
+        for(; j < Bc; ++j) tile_max = fmaxf(tile_max, __bfloat162float(sS[tid * Bc + j]));
+
+        const float m_new = fmaxf(m_old, tile_max);
+        const float corr  = ex2_approx(m_old - m_new);   // == exp(m_old - m_new)
+
+        // Pack two probabilities per F2FP (F2FP.BF16.F32.PACK_AB) + one 32-bit STS.
+        float p_sum = 0.0f;
+        for(int j2 = 0; j2 < Bc; j2 += 2){
+          const float p0 = ex2_approx(__bfloat162float(sS[tid * Bc + j2])     - m_new);   // == exp(S - m_new)
+          const float p1 = ex2_approx(__bfloat162float(sS[tid * Bc + j2 + 1]) - m_new);
+          *reinterpret_cast<__nv_bfloat162*>(&sP[canon_idx(tid, j2, Br)]) =
+              __floats2bfloat162_rn(p0, p1);
+          p_sum += p0 + p1;
+        }
+        sm[tid] = m_new; sl[tid] = l_old * corr + p_sum; sCorr[tid] = corr;
+      }
+      consumer_sync();
+
+      for(int i = tid; i < Br * D; i += Br) sO[i] *= sCorr[i / D];
+      consumer_sync();
+
+      // O_tile = P @ V, readout ACCUMULATED straight into sO (no sPV staging).
+      {
+        const uint64_t descP_base = make_smem_desc(sP, Br);
+        const uint64_t descV_base = make_smem_desc(sV, D);
+        const uint32_t idesc      = make_idesc_bf16(Br, D);
+        if(tid == 0){
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          for(int kt = 0; kt < Bc/16; ++kt){
+            uint64_t descP = advance_desc_katom(descP_base, kt, Br);
+            uint64_t descV = advance_desc_katom(descV_base, kt, D);
+            uint32_t accumulate = (kt > 0) ? 1u : 0u;
+            asm volatile(
+              "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+              :: "r"(tmem_addr), "l"(descP), "l"(descV), "r"(idesc), "r"(accumulate) : "memory");
+          }
+          mbar_commit_mma(mma_bar);
+        }
+        mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+        tmem_readout_accum_vec(sO, tmem_addr, Br, D, D);   // sO += P@V, no staging hop
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        consumer_sync();
+      }
+    } // end kv loop
+  }
+
+  __syncthreads();   // full-block reconvergence: producer is done, consumers are done
+
+  if(tid < 32)
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                 :: "r"(tmem_addr), "r"(NCOLS) : "memory");
+
+  // Normalize + write O, packing two columns per bf16x2 store (D even -> same row denom).
+  for(int i = 2 * tid; i < Br * D; i += 2 * blockDim.x){
+    const float denom = sl[i / D];
+    *reinterpret_cast<__nv_bfloat162*>(&d_O[qBase + i]) =
+        __floats2bfloat162_rn(sO[i] / denom, sO[i + 1] / denom);
+  }
+  if(tid < Br)
+    // m and l are in base-2 units: LSE_nat = ln2 * (m2 + log2(l)).
+    d_LSE[lBase + tid] = 0.6931471805599453f * (sm[tid] + log2f(sl[tid]));
+
+} // end of v18
+
 //* ============================
 //* Kernel Launcher
 //* ============================
@@ -3009,6 +4211,148 @@ void launch_gqa_v13(
                           B, Hq, Hkv, G, S, scale);
 }
 
+// V14 — V13 + cluster launch scaffolding (gqa_v14 kernel, Bc=128). __cluster_dims__
+// on the kernel makes the plain <<<>>> launch cluster-aware; gridDim.z=32 is even.
+template<int Br, int Bc, int D>
+void launch_gqa_v14(
+  __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
+  __nv_bfloat16 *d_O, float *d_LSE,
+  int B, int Hq, int Hkv, int S, int G, float scale
+){
+  static_assert(Br % 64 == 0, "Br must be a multiple of 64 for tcgen05 M = 64");
+  static_assert(Bc % 8 == 0, "Bc must be a multiple of 8 for tcgen05 N = 8");
+  static_assert(D  % 16 == 0, "D  must be a multiple of 16 for tcgen05 dense");
+
+  dim3 GRID(B, Hq, S/Br);   // z must be even (cluster dim 2 along z)
+  dim3 BLOCK(128);
+
+  static bool cfgd = false;
+  static CUtensorMap Ktmap, Vtmap;
+  if(!cfgd){
+    const uint64_t kvRows = (uint64_t)B * Hkv * S;   // K/V flattened as [B*Hkv*S, D]
+    Ktmap = make_tma_2d(d_K, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    Vtmap = make_tma_2d(d_V, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    cfgd = true;
+  }
+  gqa_v14<Br, Bc, D><<<GRID, BLOCK>>>(d_Q, d_O, d_LSE, Ktmap, Vtmap,
+                          B, Hq, Hkv, G, S, scale);
+}
+
+// V15 — V14 + multicast K/V TMA (gqa_v15 kernel, Bc=128): each K/V tile fetched from
+// HBM once per CLUSTER and multicast to both CTAs' staging.
+template<int Br, int Bc, int D>
+void launch_gqa_v15(
+  __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
+  __nv_bfloat16 *d_O, float *d_LSE,
+  int B, int Hq, int Hkv, int S, int G, float scale
+){
+  static_assert(Br % 64 == 0, "Br must be a multiple of 64 for tcgen05 M = 64");
+  static_assert(Bc % 8 == 0, "Bc must be a multiple of 8 for tcgen05 N = 8");
+  static_assert(D  % 16 == 0, "D  must be a multiple of 16 for tcgen05 dense");
+
+  dim3 GRID(B, Hq, S/Br);   // z must be even (cluster dim 2 along z)
+  dim3 BLOCK(128);
+
+  static bool cfgd = false;
+  static CUtensorMap Ktmap, Vtmap;
+  if(!cfgd){
+    const uint64_t kvRows = (uint64_t)B * Hkv * S;   // K/V flattened as [B*Hkv*S, D]
+    Ktmap = make_tma_2d(d_K, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    Vtmap = make_tma_2d(d_V, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    cfgd = true;
+  }
+  gqa_v15<Br, Bc, D><<<GRID, BLOCK>>>(d_Q, d_O, d_LSE, Ktmap, Vtmap,
+                          B, Hq, Hkv, G, S, scale);
+}
+
+// V16 — persistent kernel on the V13 core (gqa_v16, Bc=128): grid = #SMs, one
+// resident CTA per SM (smem pins that anyway), each looping over work items.
+template<int Br, int Bc, int D>
+void launch_gqa_v16(
+  __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
+  __nv_bfloat16 *d_O, float *d_LSE,
+  int B, int Hq, int Hkv, int S, int G, float scale
+){
+  static_assert(Br % 64 == 0, "Br must be a multiple of 64 for tcgen05 M = 64");
+  static_assert(Bc % 8 == 0, "Bc must be a multiple of 8 for tcgen05 N = 8");
+  static_assert(D  % 16 == 0, "D  must be a multiple of 16 for tcgen05 dense");
+
+  static bool cfgd = false;
+  static CUtensorMap Ktmap, Vtmap;
+  static int nsm = 0;
+  if(!cfgd){
+    const uint64_t kvRows = (uint64_t)B * Hkv * S;   // K/V flattened as [B*Hkv*S, D]
+    Ktmap = make_tma_2d(d_K, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    Vtmap = make_tma_2d(d_V, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    int dev; cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+    cfgd = true;
+  }
+  const int totalWork = B * Hq * (S / Br);
+  dim3 GRID(nsm < totalWork ? nsm : totalWork);
+  dim3 BLOCK(128);
+  gqa_v16<Br, Bc, D><<<GRID, BLOCK>>>(d_Q, d_O, d_LSE, Ktmap, Vtmap,
+                          B, Hq, Hkv, G, S, scale);
+}
+
+// V17 — V13 core + warp specialization (gqa_v17, Bc=128): a dedicated 5th "producer"
+// warp (threads 128..159) issues K/V TMA loads decoupled from the 4 "consumer" warps
+// (threads 0..127, unchanged V13 math), handshaking via load_bar/free_bar mbarriers
+// instead of a block-wide __syncthreads. Same single-buffered smem footprint as V13 —
+// this step is about overlapping TMA latency with compute, not about adding a buffer.
+template<int Br, int Bc, int D>
+void launch_gqa_v17(
+  __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
+  __nv_bfloat16 *d_O, float *d_LSE,
+  int B, int Hq, int Hkv, int S, int G, float scale
+){
+  static_assert(Br == 128, "V17's consumer group is hardwired to 128 threads");
+  static_assert(Bc % 8 == 0, "Bc must be a multiple of 8 for tcgen05 N = 8");
+  static_assert(D  % 16 == 0, "D  must be a multiple of 16 for tcgen05 dense");
+
+  dim3 GRID(B, Hq, S/Br);
+  dim3 BLOCK(160);   // 128 consumer threads (warps 0-3) + 32 producer threads (warp 4)
+
+  static bool cfgd = false;
+  static CUtensorMap Ktmap, Vtmap;
+  if(!cfgd){
+    const uint64_t kvRows = (uint64_t)B * Hkv * S;   // K/V flattened as [B*Hkv*S, D]
+    Ktmap = make_tma_2d(d_K, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    Vtmap = make_tma_2d(d_V, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    cfgd = true;
+  }
+  gqa_v17<Br, Bc, D><<<GRID, BLOCK>>>(d_Q, d_O, d_LSE, Ktmap, Vtmap,
+                          B, Hq, Hkv, G, S, scale);
+}
+
+// V18 — V17 + double-buffered TMA staging (gqa_v18, Bc=128): ping-pong sKstage/sVstage
+// so the producer can run a full iteration ahead instead of just to the reorder point.
+// sS moves to bf16 to fit the extra staging buffer under the static-smem ceiling.
+template<int Br, int Bc, int D>
+void launch_gqa_v18(
+  __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
+  __nv_bfloat16 *d_O, float *d_LSE,
+  int B, int Hq, int Hkv, int S, int G, float scale
+){
+  static_assert(Br == 128, "V18's consumer group is hardwired to 128 threads");
+  static_assert(Bc % 8 == 0, "Bc must be a multiple of 8 for tcgen05 N = 8");
+  static_assert(D  % 16 == 0, "D  must be a multiple of 16 for tcgen05 dense");
+
+  dim3 GRID(B, Hq, S/Br);
+  dim3 BLOCK(160);   // 128 consumer threads (warps 0-3) + 32 producer threads (warp 4)
+
+  static bool cfgd = false;
+  static CUtensorMap Ktmap, Vtmap;
+  if(!cfgd){
+    const uint64_t kvRows = (uint64_t)B * Hkv * S;   // K/V flattened as [B*Hkv*S, D]
+    Ktmap = make_tma_2d(d_K, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    Vtmap = make_tma_2d(d_V, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    cfgd = true;
+  }
+  gqa_v18<Br, Bc, D><<<GRID, BLOCK>>>(d_Q, d_O, d_LSE, Ktmap, Vtmap,
+                          B, Hq, Hkv, G, S, scale);
+}
+
 
 int main(){
   std::cout << "Benchmarking Grouped-Query Attention kernels — Blackwell SM_103 (B300)\n";
@@ -3303,6 +4647,81 @@ int main(){
     reportPrecision("  lse      ", h_LSE_ref.data(), h_LSE.data(),   Nlse);
     std::cout << "  O   : "; checkResult(h_O_ref.data(),   h_O_f32.data(), Nq,   2e-2f, 2e-2f);
     std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
+
+    // ── V14 : V13 + cluster launch scaffolding ──
+    launch_gqa_v14<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_LSE.data(), d_LSE, Nlse * sizeof(float),         cudaMemcpyDeviceToHost));
+
+    for(size_t i = 0; i < Nq; ++i) h_O_f32[i] = __bfloat162float(h_O[i]);
+
+    std::cout << "\nCorrectness V14 (V13 + cluster launch vs PyTorch bf16 SDPA):\n";
+    reportPrecision("  output O ", h_O_ref.data(),   h_O_f32.data(), Nq);
+    reportPrecision("  lse      ", h_LSE_ref.data(), h_LSE.data(),   Nlse);
+    std::cout << "  O   : "; checkResult(h_O_ref.data(),   h_O_f32.data(), Nq,   2e-2f, 2e-2f);
+    std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
+
+    // ── V15 : V14 + multicast K/V TMA ──
+    launch_gqa_v15<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_LSE.data(), d_LSE, Nlse * sizeof(float),         cudaMemcpyDeviceToHost));
+
+    for(size_t i = 0; i < Nq; ++i) h_O_f32[i] = __bfloat162float(h_O[i]);
+
+    std::cout << "\nCorrectness V15 (V14 + multicast K/V TMA vs PyTorch bf16 SDPA):\n";
+    reportPrecision("  output O ", h_O_ref.data(),   h_O_f32.data(), Nq);
+    reportPrecision("  lse      ", h_LSE_ref.data(), h_LSE.data(),   Nlse);
+    std::cout << "  O   : "; checkResult(h_O_ref.data(),   h_O_f32.data(), Nq,   2e-2f, 2e-2f);
+    std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
+
+    // ── V16 : persistent kernel (V13 core, 1 resident CTA/SM) ──
+    launch_gqa_v16<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_LSE.data(), d_LSE, Nlse * sizeof(float),         cudaMemcpyDeviceToHost));
+
+    for(size_t i = 0; i < Nq; ++i) h_O_f32[i] = __bfloat162float(h_O[i]);
+
+    std::cout << "\nCorrectness V16 (persistent kernel vs PyTorch bf16 SDPA):\n";
+    reportPrecision("  output O ", h_O_ref.data(),   h_O_f32.data(), Nq);
+    reportPrecision("  lse      ", h_LSE_ref.data(), h_LSE.data(),   Nlse);
+    std::cout << "  O   : "; checkResult(h_O_ref.data(),   h_O_f32.data(), Nq,   2e-2f, 2e-2f);
+    std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
+
+    // ── V17 : V13 core + warp specialization (dedicated TMA producer warp) ──
+    launch_gqa_v17<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_LSE.data(), d_LSE, Nlse * sizeof(float),         cudaMemcpyDeviceToHost));
+
+    for(size_t i = 0; i < Nq; ++i) h_O_f32[i] = __bfloat162float(h_O[i]);
+
+    std::cout << "\nCorrectness V17 (V13 + warp-specialized TMA producer vs PyTorch bf16 SDPA):\n";
+    reportPrecision("  output O ", h_O_ref.data(),   h_O_f32.data(), Nq);
+    reportPrecision("  lse      ", h_LSE_ref.data(), h_LSE.data(),   Nlse);
+    std::cout << "  O   : "; checkResult(h_O_ref.data(),   h_O_f32.data(), Nq,   2e-2f, 2e-2f);
+    std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
+
+    // ── V18 : V17 + double-buffered TMA staging (bf16 sS to fit smem) ──
+    launch_gqa_v18<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_LSE.data(), d_LSE, Nlse * sizeof(float),         cudaMemcpyDeviceToHost));
+
+    for(size_t i = 0; i < Nq; ++i) h_O_f32[i] = __bfloat162float(h_O[i]);
+
+    std::cout << "\nCorrectness V18 (V17 + double-buffered TMA staging vs PyTorch bf16 SDPA):\n";
+    reportPrecision("  output O ", h_O_ref.data(),   h_O_f32.data(), Nq);
+    reportPrecision("  lse      ", h_LSE_ref.data(), h_LSE.data(),   Nlse);
+    std::cout << "  O   : "; checkResult(h_O_ref.data(),   h_O_f32.data(), Nq,   2e-2f, 2e-2f);
+    std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
   }
 
   //* ── Benchmark ──────────────────────────────────────────────────────────
@@ -3397,6 +4816,36 @@ int main(){
     100, 25, flops, bytes
   );
   displayStats("V13 — V12 at Bc = 128 (32 KV tiles, bf16)", stats_v13);
+
+  KernelStats stats_v14 = benchmarkKernel(
+    [&](){ launch_gqa_v14<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
+    100, 25, flops, bytes
+  );
+  displayStats("V14 — V13 + cluster launch (2-CTA scaffolding, bf16)", stats_v14);
+
+  KernelStats stats_v15 = benchmarkKernel(
+    [&](){ launch_gqa_v15<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
+    100, 25, flops, bytes
+  );
+  displayStats("V15 — V14 + multicast K/V TMA (1 fetch per cluster, bf16)", stats_v15);
+
+  KernelStats stats_v16 = benchmarkKernel(
+    [&](){ launch_gqa_v16<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
+    100, 25, flops, bytes
+  );
+  displayStats("V16 — persistent kernel (V13 core, 1 resident CTA/SM, bf16)", stats_v16);
+
+  KernelStats stats_v17 = benchmarkKernel(
+    [&](){ launch_gqa_v17<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
+    100, 25, flops, bytes
+  );
+  displayStats("V17 — V13 + warp specialization (dedicated TMA producer warp, bf16)", stats_v17);
+
+  KernelStats stats_v18 = benchmarkKernel(
+    [&](){ launch_gqa_v18<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
+    100, 25, flops, bytes
+  );
+  displayStats("V18 — V17 + double-buffered TMA staging (bf16 sS, bf16)", stats_v18);
 
   CUDA_CHECK(cudaFree(d_Q));
   CUDA_CHECK(cudaFree(d_K));

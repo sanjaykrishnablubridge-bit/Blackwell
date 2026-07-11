@@ -41,6 +41,11 @@ if(GPU_CC EQUAL 103)
     # The virtual arch must carry the "a", so spell it out with -gencode.
     set(CMAKE_CUDA_ARCHITECTURES OFF)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_103a,code=sm_103a")
+elseif(GPU_CC EQUAL 100)
+    # B200 (sm_100). tcgen05 is a Blackwell-datacenter-family feature shared by
+    # sm_100a and sm_103a, so the same "a"-carrying virtual arch trick applies here.
+    set(CMAKE_CUDA_ARCHITECTURES OFF)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_100a,code=sm_100a")
 else()
     set(CMAKE_CUDA_ARCHITECTURES OFF)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_120a,code=sm_120a")
@@ -53,10 +58,11 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo -O3 -lcudart")
 
 # Auto-discover the .cu files to build. CONFIGURE_DEPENDS re-scans when files
 # are added or removed.
-#   * On an sm_103 GPU, build ONLY the kernels under src/SM103.
+#   * On an sm_103 or sm_100 GPU, build ONLY the kernels under src/SM103 (they use
+#     tcgen05, a Blackwell-datacenter-family feature shared by both architectures).
 #   * On any other GPU, build everything except the sm_103-specific kernels
 #     (which use features unavailable on other architectures).
-if(GPU_CC EQUAL 103)
+if(GPU_CC EQUAL 103 OR GPU_CC EQUAL 100)
     file(GLOB_RECURSE KERNEL_SOURCES CONFIGURE_DEPENDS src/SM103/*.cu)
 else()
     file(GLOB_RECURSE KERNEL_SOURCES CONFIGURE_DEPENDS src/*.cu)
