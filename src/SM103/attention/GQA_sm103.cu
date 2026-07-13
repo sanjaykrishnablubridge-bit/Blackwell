@@ -5205,6 +5205,522 @@ __global__ void __cluster_dims__(2, 1, 1) gqa_v21(
 
 } // end of v21
 
+// =================================
+//  V22 : V21 + warp specialization (dedicated producer warp, single-buffered — V17's step)
+// =================================
+// V21 proved cta_group::2 correct and reasonably fast (8.98ms) but is still fully
+// bulk-synchronous like V14: every K/V tile's TMA wait sits on the critical path
+// before ANY compute starts. V17 showed (on the cta_group::1 core) that decoupling
+// the TMA issue into a dedicated producer warp — talking to the 4 consumer warps via
+// load_bar/free_bar mbarriers and a named `bar.sync` instead of a block-wide
+// `__syncthreads` — lets the producer prefetch tile kc+1 while the consumers are
+// still computing tile kc, at ZERO smem cost (still single-buffered). This applies
+// that exact pattern on top of V21's correct 2-CTA B-split, unchanged otherwise:
+//   - BLOCK grows from 128 to 160: threads 0-127 are the 4 "consumer" warps (same
+//     tid, same TMEM-readout warp mapping, same MMA-issue/softmax/PV math as V21);
+//     threads 128-159 are the producer warp (only tid==128 active, mirroring V17).
+//   - The producer computes this rank's key-half / head-dim-half offsets from
+//     `crank` exactly as V21's tid==0 did — crank is a per-CTA value, so it's
+//     identical whichever thread reads it.
+//   - `cluster.sync()` (cta_group::2 alloc-visibility fence, and the pre-dealloc
+//     fence) are CTA-collective and must involve ALL 160 threads, same call sites as
+//     V21 — only the KV loop's per-tile synchronization moves to the producer/
+//     consumer split (named `bar.sync 1,128` for the 128 consumer threads, ordinary
+//     mbarriers between producer and consumer).
+//   - TMEM alloc/dealloc (warp-collective, tid<32) is untouched — warp 0 is still
+//     entirely within the consumer group in the 160-thread layout.
+// Precision unaffected (fp32 sS throughout, same as V21). Double-buffering the
+// staging (V18's next step) is deliberately deferred — this isolates the pure cost/
+// benefit of decoupling the wait before spending extra smem on a second buffer.
+template<int Br, int Bc, int D>
+__global__ void __cluster_dims__(2, 1, 1) gqa_v22(
+  __nv_bfloat16 *d_Q,
+  __nv_bfloat16 *d_O,
+  float *d_LSE,
+  const __grid_constant__ CUtensorMap Ktmap_half,  // K, box_rows = Bc/2 (key-range split)
+  const __grid_constant__ CUtensorMap Vtmap_half,  // V, box_cols = D/2  (head-dim split)
+  int B,
+  int Hq,
+  int Hkv,
+  int G,
+  int S,
+  float scale
+){
+  static_assert(Bc % 2 == 0, "Bc must be even to split the key range in half");
+  static_assert(D  % 2 == 0, "D must be even to split the head dim in half");
+  static_assert(Br == 128, "V22's consumer group is hardwired to 128 threads (TMEM readout needs warps 0-3)");
+  constexpr int Bc_half = Bc / 2;
+  constexpr int D_half  = D / 2;
+
+  const int q_tile = blockIdx.x;   // paired dimension MUST be x — see gqa_v20 header
+  const int hq     = blockIdx.y;
+  const int b      = blockIdx.z;
+  const int hkv    = hq / G;
+  const int tid    = threadIdx.x;   // 0..159: 0..127 consumer, 128..159 producer
+
+  cg::cluster_group cluster = cg::this_cluster();
+  const unsigned int crank  = cluster.block_rank();   // 0 = issuer, 1 = peer
+
+  const int q_row0   = q_tile * Br;
+  const int nKVTiles = S / Bc;
+  const int kvRow0   = (b * Hkv + hkv) * S;   // first K/V row of this head in the flat tensor
+
+  const long qBase  = ((long)(b * Hq + hq) * S + q_row0) * D;
+  const long lBase  = ((long)(b * Hq + hq) * S + q_row0);
+
+  const float scale_l2e = scale * 1.4426950408889634f;   // scale * float32 log2(e)
+
+  __shared__ __align__(16)  __nv_bfloat16 sQ[Br * D];
+  __shared__ __align__(128) __nv_bfloat16 sKstage[Bc_half * D];      // this rank's key-half, raw
+  __shared__ __align__(128) __nv_bfloat16 sVstage[Bc * D_half];      // this rank's head-dim-half, raw
+  __shared__ __align__(16)  __nv_bfloat16 sK[Bc_half * D];           // canonical K-major, rows=Bc_half
+  __shared__ __align__(16)  __nv_bfloat16 sV[D_half * Bc];           // canonical transposed, rows=D_half
+  __shared__ __align__(16)  __nv_bfloat16 sP[Br * Bc];
+  __shared__ __align__(16)  float         sS[Br * Bc];               // fp32 — no precision trade
+  __shared__ __align__(16)  float         sO[Br * D];
+  __shared__ float sm[Br];
+  __shared__ float sl[Br];
+  __shared__ float sCorr[Br];
+  __shared__ __align__(8) uint64_t s_mma_bar;
+  __shared__ __align__(8) uint64_t s_load_bar;   // producer -> consumer: tile bytes ready
+  __shared__ __align__(8) uint64_t s_free_bar;   // consumer -> producer: staging buffer free
+
+  for(int i = tid; i < Br * D; i += blockDim.x){
+    const int r = i / D, c = i % D;
+    sQ[canon_idx(r, c, Br)] = d_Q[qBase + i];
+    sO[i] = 0.0f;
+  }
+  if(tid < Br){ sm[tid] = -INFINITY; sl[tid] = 0.0f; }
+
+  const uint32_t mma_bar = (uint32_t)__cvta_generic_to_shared(&s_mma_bar);
+  const uint32_t lbar    = (uint32_t)__cvta_generic_to_shared(&s_load_bar);
+  const uint32_t fbar    = (uint32_t)__cvta_generic_to_shared(&s_free_bar);
+  if(tid == 0){
+    mbar_init(mma_bar, 1);
+    mbar_init(lbar, 1);
+    mbar_init(fbar, 1);
+    cluster_fence_mbarrier_init();
+  }
+  cluster.sync();   // CTA-collective — all 160 threads (consumer + producer)
+
+  constexpr uint32_t NCOLS = (Bc > D) ? (uint32_t)Bc : (uint32_t)D;
+  static_assert(NCOLS >= 32 && (NCOLS & (NCOLS - 1)) == 0,
+                "tcgen05 column count must be a power of two >= 32");
+  constexpr uint32_t RANK_WARP_SPAN = (uint32_t)Br / 32u;
+
+  uint32_t tmem_addr;
+  {
+    __shared__ uint32_t s_tmem_addr;
+    if(tid < 32){
+      uint32_t s_addr = (uint32_t)__cvta_generic_to_shared(&s_tmem_addr);
+      asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
+                   :: "r"(s_addr), "r"(NCOLS) : "memory");
+      asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;" ::: "memory");
+    }
+    __syncthreads();   // full 160-thread barrier to broadcast tmem_addr
+    tmem_addr = s_tmem_addr;
+  }
+
+  // Each rank moves HALF the bytes of V20's per-rank load, same as V21.
+  const uint32_t TX = ((uint32_t)Bc_half * (uint32_t)D + (uint32_t)Bc * (uint32_t)D_half)
+                    * (uint32_t)sizeof(__nv_bfloat16);
+  const uint32_t rank_warp_offset = crank * RANK_WARP_SPAN;
+  const uint32_t sKstage_addr = (uint32_t)__cvta_generic_to_shared(sKstage);
+  const uint32_t sVstage_addr = (uint32_t)__cvta_generic_to_shared(sVstage);
+
+  if(tid >= 128){
+    // ---- Producer warp: issues this rank's key-half/head-dim-half TMA loads. ----
+    if(tid == 128){
+      int free_phase = 0;
+      for(int kc = 0; kc < nKVTiles; ++kc){
+        if(kc > 0){ mbar_wait(fbar, free_phase); free_phase ^= 1; }
+        const int kRow = kvRow0 + kc * Bc + (int)crank * Bc_half;
+        const int vCol = (int)crank * D_half;
+        mbar_expect_tx(lbar, TX);
+        tma_load_2d(sKstage_addr, &Ktmap_half, 0, kRow, lbar);
+        tma_load_2d(sVstage_addr, &Vtmap_half, vCol, kvRow0 + kc * Bc, lbar);
+        mbar_arrive(lbar);
+      }
+    }
+  } else {
+    // ---- Consumer warps (0-3): reorder + MMA-issue + softmax + PV, unchanged from V21. ----
+    const uint64_t descQ_base = make_smem_desc(sQ, Br);
+    int mbar_phase = 0;
+    int load_phase = 0;
+
+    for(int kc = 0; kc < nKVTiles; ++kc){
+      mbar_wait(lbar, load_phase); load_phase ^= 1;
+      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+      consumer_sync();
+
+      for(int i = tid; i < Bc_half * D; i += Br){
+        const int bc = i / D, d = i % D;
+        sK[canon_idx(bc, d, Bc_half)] = sKstage[i];   // K-major, local rows = Bc_half
+      }
+      for(int i = tid; i < Bc * D_half; i += Br){
+        const int bc = i / D_half, d = i % D_half;
+        sV[canon_idx(d, bc, D_half)] = sVstage[i];    // transposed, local rows = D_half
+      }
+      consumer_sync();
+      // Staging buffers fully drained — let the producer reuse them for kc+1 while
+      // this iteration's MMA/softmax/PV run.
+      if(tid == 0) mbar_arrive(fbar);
+
+      // S2 = (Q @ K^T) * (scale*log2e) -> sS[Br, Bc]. idesc.N stays the FULL Bc.
+      {
+        const uint32_t idesc = make_idesc_bf16(2 * Br, Bc);
+        if(crank == 0 && tid == 0){
+          const uint64_t descK_base = make_smem_desc(sK, Bc_half);
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          for(int kt = 0; kt < D/16; ++kt){
+            uint64_t descQ = advance_desc_katom(descQ_base, kt, Br);
+            uint64_t descK = advance_desc_katom(descK_base, kt, Bc_half);
+            uint32_t accumulate = (kt > 0) ? 1u : 0u;
+            asm volatile(
+              "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+              :: "r"(tmem_addr), "l"(descQ), "l"(descK), "r"(idesc), "r"(accumulate) : "memory");
+          }
+          mbar_commit_mma_2cta_multicast(mma_bar, 0b11);
+        }
+        mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+        tmem_readout_to_smem_vec_2cta(sS, tmem_addr, Br, Bc, Bc, scale_l2e, rank_warp_offset);
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        consumer_sync();
+      }
+
+      // online-softmax stats + unnormalized P — fully local to this rank's own rows.
+      {
+        const float m_old = sm[tid];
+        const float l_old = sl[tid];
+
+        float tile_max = -INFINITY;
+        int j = 0;
+        for(; j + 2 < Bc; j += 3)
+          tile_max = fmaxf(tile_max,
+                           fmaxf(sS[tid * Bc + j],
+                                 fmaxf(sS[tid * Bc + j + 1], sS[tid * Bc + j + 2])));
+        for(; j < Bc; ++j) tile_max = fmaxf(tile_max, sS[tid * Bc + j]);
+
+        const float m_new = fmaxf(m_old, tile_max);
+        const float corr  = ex2_approx(m_old - m_new);
+
+        float p_sum = 0.0f;
+        for(int j2 = 0; j2 < Bc; j2 += 2){
+          const float p0 = ex2_approx(sS[tid * Bc + j2]     - m_new);
+          const float p1 = ex2_approx(sS[tid * Bc + j2 + 1] - m_new);
+          *reinterpret_cast<__nv_bfloat162*>(&sP[canon_idx(tid, j2, Br)]) =
+              __floats2bfloat162_rn(p0, p1);
+          p_sum += p0 + p1;
+        }
+        sm[tid] = m_new; sl[tid] = l_old * corr + p_sum; sCorr[tid] = corr;
+      }
+      consumer_sync();
+
+      for(int i = tid; i < Br * D; i += Br) sO[i] *= sCorr[i / D];
+      consumer_sync();
+
+      // O_tile = P@V. A=P local & FULL; B=V supplies only this rank's D_half-half.
+      {
+        const uint64_t descP_base = make_smem_desc(sP, Br);
+        const uint32_t idesc      = make_idesc_bf16(2 * Br, D);
+        if(crank == 0 && tid == 0){
+          const uint64_t descV_base = make_smem_desc(sV, D_half);
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          for(int kt = 0; kt < Bc/16; ++kt){
+            uint64_t descP = advance_desc_katom(descP_base, kt, Br);
+            uint64_t descV = advance_desc_katom(descV_base, kt, D_half);
+            uint32_t accumulate = (kt > 0) ? 1u : 0u;
+            asm volatile(
+              "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+              :: "r"(tmem_addr), "l"(descP), "l"(descV), "r"(idesc), "r"(accumulate) : "memory");
+          }
+          mbar_commit_mma_2cta_multicast(mma_bar, 0b11);
+        }
+        mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+        tmem_readout_accum_vec_2cta(sO, tmem_addr, Br, D, D, rank_warp_offset);
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        consumer_sync();
+      }
+    } // end kv loop
+  }
+
+  __syncthreads();   // full-block reconvergence: producer is done, consumers are done
+  cluster.sync();     // both ranks fully done with TMEM before either deallocs
+  if(tid < 32)
+    asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+                 :: "r"(tmem_addr), "r"(NCOLS) : "memory");
+  __syncthreads();
+
+  for(int i = 2 * tid; i < Br * D; i += 2 * blockDim.x){
+    const float denom = sl[i / D];
+    *reinterpret_cast<__nv_bfloat162*>(&d_O[qBase + i]) =
+        __floats2bfloat162_rn(sO[i] / denom, sO[i + 1] / denom);
+  }
+  if(tid < Br)
+    d_LSE[lBase + tid] = 0.6931471805599453f * (sm[tid] + log2f(sl[tid]));
+
+} // end of v22
+
+// =================================
+//  V23 : V22 + double-buffered TMA staging (V18's step, no precision trade this time)
+// =================================
+// V22 alone was ~neutral over V21 (8.82ms vs 8.98ms) — the same "decoupling the wait
+// buys little with only one buffer to wait on" pattern V17 showed before V18's double
+// buffer unlocked its 18% win. V21's N-half split already halved the per-rank K/V
+// smem footprint versus V20 (each rank moves Bc_half*D + Bc*D_half bytes, not the
+// full Bc*D duplicated), so there is real headroom here: at Bc=128,D=64 the running
+// total (sQ+sKstage+sVstage+sK+sV+sP+sS(fp32)+sO+scalars) is ~178KB against the
+// ~226KB static-smem ceiling — doubling just sKstage+sVstage costs +16KB, landing at
+// ~194KB. UNLIKE V18, sS stays fp32 here — no precision trade needed at all, so this
+// should be a pure speed win with the same clean V17-level precision as V21/V22.
+// Structure: ping-pong sKstage[2]/sVstage[2] + lbar[2]/fbar[2], same slot handshake
+// as V18 (first wait for each slot is at kc==slot+2, since both start empty).
+template<int Br, int Bc, int D>
+__global__ void __cluster_dims__(2, 1, 1) gqa_v23(
+  __nv_bfloat16 *d_Q,
+  __nv_bfloat16 *d_O,
+  float *d_LSE,
+  const __grid_constant__ CUtensorMap Ktmap_half,  // K, box_rows = Bc/2 (key-range split)
+  const __grid_constant__ CUtensorMap Vtmap_half,  // V, box_cols = D/2  (head-dim split)
+  int B,
+  int Hq,
+  int Hkv,
+  int G,
+  int S,
+  float scale
+){
+  static_assert(Bc % 2 == 0, "Bc must be even to split the key range in half");
+  static_assert(D  % 2 == 0, "D must be even to split the head dim in half");
+  static_assert(Br == 128, "V23's consumer group is hardwired to 128 threads (TMEM readout needs warps 0-3)");
+  constexpr int Bc_half = Bc / 2;
+  constexpr int D_half  = D / 2;
+
+  const int q_tile = blockIdx.x;   // paired dimension MUST be x — see gqa_v20 header
+  const int hq     = blockIdx.y;
+  const int b      = blockIdx.z;
+  const int hkv    = hq / G;
+  const int tid    = threadIdx.x;   // 0..159: 0..127 consumer, 128..159 producer
+
+  cg::cluster_group cluster = cg::this_cluster();
+  const unsigned int crank  = cluster.block_rank();   // 0 = issuer, 1 = peer
+
+  const int q_row0   = q_tile * Br;
+  const int nKVTiles = S / Bc;
+  const int kvRow0   = (b * Hkv + hkv) * S;   // first K/V row of this head in the flat tensor
+
+  const long qBase  = ((long)(b * Hq + hq) * S + q_row0) * D;
+  const long lBase  = ((long)(b * Hq + hq) * S + q_row0);
+
+  const float scale_l2e = scale * 1.4426950408889634f;   // scale * float32 log2(e)
+
+  __shared__ __align__(16)  __nv_bfloat16 sQ[Br * D];
+  __shared__ __align__(128) __nv_bfloat16 sKstage[2][Bc_half * D];   // this rank's key-half, raw, DOUBLE buffer
+  __shared__ __align__(128) __nv_bfloat16 sVstage[2][Bc * D_half];   // this rank's head-dim-half, raw, DOUBLE buffer
+  __shared__ __align__(16)  __nv_bfloat16 sK[Bc_half * D];           // canonical K-major, rows=Bc_half
+  __shared__ __align__(16)  __nv_bfloat16 sV[D_half * Bc];           // canonical transposed, rows=D_half
+  __shared__ __align__(16)  __nv_bfloat16 sP[Br * Bc];
+  __shared__ __align__(16)  float         sS[Br * Bc];               // fp32 — no precision trade
+  __shared__ __align__(16)  float         sO[Br * D];
+  __shared__ float sm[Br];
+  __shared__ float sl[Br];
+  __shared__ float sCorr[Br];
+  __shared__ __align__(8) uint64_t s_mma_bar;
+  __shared__ __align__(8) uint64_t s_load_bar[2];   // producer -> consumer: slot's bytes ready
+  __shared__ __align__(8) uint64_t s_free_bar[2];   // consumer -> producer: slot is free
+
+  for(int i = tid; i < Br * D; i += blockDim.x){
+    const int r = i / D, c = i % D;
+    sQ[canon_idx(r, c, Br)] = d_Q[qBase + i];
+    sO[i] = 0.0f;
+  }
+  if(tid < Br){ sm[tid] = -INFINITY; sl[tid] = 0.0f; }
+
+  const uint32_t mma_bar = (uint32_t)__cvta_generic_to_shared(&s_mma_bar);
+  const uint32_t lbar0   = (uint32_t)__cvta_generic_to_shared(&s_load_bar[0]);
+  const uint32_t lbar1   = (uint32_t)__cvta_generic_to_shared(&s_load_bar[1]);
+  const uint32_t fbar0   = (uint32_t)__cvta_generic_to_shared(&s_free_bar[0]);
+  const uint32_t fbar1   = (uint32_t)__cvta_generic_to_shared(&s_free_bar[1]);
+  if(tid == 0){
+    mbar_init(mma_bar, 1);
+    mbar_init(lbar0, 1); mbar_init(lbar1, 1);
+    mbar_init(fbar0, 1); mbar_init(fbar1, 1);
+    cluster_fence_mbarrier_init();
+  }
+  cluster.sync();   // CTA-collective — all 160 threads (consumer + producer)
+
+  constexpr uint32_t NCOLS = (Bc > D) ? (uint32_t)Bc : (uint32_t)D;
+  static_assert(NCOLS >= 32 && (NCOLS & (NCOLS - 1)) == 0,
+                "tcgen05 column count must be a power of two >= 32");
+  constexpr uint32_t RANK_WARP_SPAN = (uint32_t)Br / 32u;
+
+  uint32_t tmem_addr;
+  {
+    __shared__ uint32_t s_tmem_addr;
+    if(tid < 32){
+      uint32_t s_addr = (uint32_t)__cvta_generic_to_shared(&s_tmem_addr);
+      asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
+                   :: "r"(s_addr), "r"(NCOLS) : "memory");
+      asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;" ::: "memory");
+    }
+    __syncthreads();   // full 160-thread barrier to broadcast tmem_addr
+    tmem_addr = s_tmem_addr;
+  }
+
+  // Each rank moves HALF the bytes of V20's per-rank load, same as V21/V22.
+  const uint32_t TX = ((uint32_t)Bc_half * (uint32_t)D + (uint32_t)Bc * (uint32_t)D_half)
+                    * (uint32_t)sizeof(__nv_bfloat16);
+  const uint32_t rank_warp_offset = crank * RANK_WARP_SPAN;
+  const uint32_t sKstage_addr[2] = {
+    (uint32_t)__cvta_generic_to_shared(sKstage[0]),
+    (uint32_t)__cvta_generic_to_shared(sKstage[1])
+  };
+  const uint32_t sVstage_addr[2] = {
+    (uint32_t)__cvta_generic_to_shared(sVstage[0]),
+    (uint32_t)__cvta_generic_to_shared(sVstage[1])
+  };
+  const uint32_t lbar[2] = {lbar0, lbar1};
+  const uint32_t fbar[2] = {fbar0, fbar1};
+
+  if(tid >= 128){
+    // ---- Producer warp: fills both slots ahead of the consumers. ----
+    if(tid == 128){
+      int free_phase[2] = {0, 0};
+      for(int kc = 0; kc < nKVTiles; ++kc){
+        const int slot = kc & 1;
+        // Slots 0 and 1 start empty, so the first wait for each is at kc == slot+2.
+        if(kc >= 2){ mbar_wait(fbar[slot], free_phase[slot]); free_phase[slot] ^= 1; }
+        const int kRow = kvRow0 + kc * Bc + (int)crank * Bc_half;
+        const int vCol = (int)crank * D_half;
+        mbar_expect_tx(lbar[slot], TX);
+        tma_load_2d(sKstage_addr[slot], &Ktmap_half, 0, kRow, lbar[slot]);
+        tma_load_2d(sVstage_addr[slot], &Vtmap_half, vCol, kvRow0 + kc * Bc, lbar[slot]);
+        mbar_arrive(lbar[slot]);
+      }
+    }
+  } else {
+    // ---- Consumer warps (0-3): reorder + MMA-issue + softmax + PV. ----
+    const uint64_t descQ_base = make_smem_desc(sQ, Br);
+    int mbar_phase = 0;
+    int load_phase[2] = {0, 0};
+
+    for(int kc = 0; kc < nKVTiles; ++kc){
+      const int slot = kc & 1;
+      mbar_wait(lbar[slot], load_phase[slot]); load_phase[slot] ^= 1;
+      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+      consumer_sync();
+
+      for(int i = tid; i < Bc_half * D; i += Br){
+        const int bc = i / D, d = i % D;
+        sK[canon_idx(bc, d, Bc_half)] = sKstage[slot][i];   // K-major, local rows = Bc_half
+      }
+      for(int i = tid; i < Bc * D_half; i += Br){
+        const int bc = i / D_half, d = i % D_half;
+        sV[canon_idx(d, bc, D_half)] = sVstage[slot][i];    // transposed, local rows = D_half
+      }
+      consumer_sync();
+      // This slot is fully drained — let the producer reuse it two tiles from now,
+      // while this iteration's MMA/softmax/PV run.
+      if(tid == 0) mbar_arrive(fbar[slot]);
+
+      // S2 = (Q @ K^T) * (scale*log2e) -> sS[Br, Bc]. idesc.N stays the FULL Bc.
+      {
+        const uint32_t idesc = make_idesc_bf16(2 * Br, Bc);
+        if(crank == 0 && tid == 0){
+          const uint64_t descK_base = make_smem_desc(sK, Bc_half);
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          for(int kt = 0; kt < D/16; ++kt){
+            uint64_t descQ = advance_desc_katom(descQ_base, kt, Br);
+            uint64_t descK = advance_desc_katom(descK_base, kt, Bc_half);
+            uint32_t accumulate = (kt > 0) ? 1u : 0u;
+            asm volatile(
+              "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+              :: "r"(tmem_addr), "l"(descQ), "l"(descK), "r"(idesc), "r"(accumulate) : "memory");
+          }
+          mbar_commit_mma_2cta_multicast(mma_bar, 0b11);
+        }
+        mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+        tmem_readout_to_smem_vec_2cta(sS, tmem_addr, Br, Bc, Bc, scale_l2e, rank_warp_offset);
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        consumer_sync();
+      }
+
+      // online-softmax stats + unnormalized P — fully local to this rank's own rows.
+      {
+        const float m_old = sm[tid];
+        const float l_old = sl[tid];
+
+        float tile_max = -INFINITY;
+        int j = 0;
+        for(; j + 2 < Bc; j += 3)
+          tile_max = fmaxf(tile_max,
+                           fmaxf(sS[tid * Bc + j],
+                                 fmaxf(sS[tid * Bc + j + 1], sS[tid * Bc + j + 2])));
+        for(; j < Bc; ++j) tile_max = fmaxf(tile_max, sS[tid * Bc + j]);
+
+        const float m_new = fmaxf(m_old, tile_max);
+        const float corr  = ex2_approx(m_old - m_new);
+
+        float p_sum = 0.0f;
+        for(int j2 = 0; j2 < Bc; j2 += 2){
+          const float p0 = ex2_approx(sS[tid * Bc + j2]     - m_new);
+          const float p1 = ex2_approx(sS[tid * Bc + j2 + 1] - m_new);
+          *reinterpret_cast<__nv_bfloat162*>(&sP[canon_idx(tid, j2, Br)]) =
+              __floats2bfloat162_rn(p0, p1);
+          p_sum += p0 + p1;
+        }
+        sm[tid] = m_new; sl[tid] = l_old * corr + p_sum; sCorr[tid] = corr;
+      }
+      consumer_sync();
+
+      for(int i = tid; i < Br * D; i += Br) sO[i] *= sCorr[i / D];
+      consumer_sync();
+
+      // O_tile = P@V. A=P local & FULL; B=V supplies only this rank's D_half-half.
+      {
+        const uint64_t descP_base = make_smem_desc(sP, Br);
+        const uint32_t idesc      = make_idesc_bf16(2 * Br, D);
+        if(crank == 0 && tid == 0){
+          const uint64_t descV_base = make_smem_desc(sV, D_half);
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          for(int kt = 0; kt < Bc/16; ++kt){
+            uint64_t descP = advance_desc_katom(descP_base, kt, Br);
+            uint64_t descV = advance_desc_katom(descV_base, kt, D_half);
+            uint32_t accumulate = (kt > 0) ? 1u : 0u;
+            asm volatile(
+              "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+              :: "r"(tmem_addr), "l"(descP), "l"(descV), "r"(idesc), "r"(accumulate) : "memory");
+          }
+          mbar_commit_mma_2cta_multicast(mma_bar, 0b11);
+        }
+        mbar_wait(mma_bar, mbar_phase); mbar_phase ^= 1;
+        tmem_readout_accum_vec_2cta(sO, tmem_addr, Br, D, D, rank_warp_offset);
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        consumer_sync();
+      }
+    } // end kv loop
+  }
+
+  __syncthreads();   // full-block reconvergence: producer is done, consumers are done
+  cluster.sync();     // both ranks fully done with TMEM before either deallocs
+  if(tid < 32)
+    asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
+                 :: "r"(tmem_addr), "r"(NCOLS) : "memory");
+  __syncthreads();
+
+  for(int i = 2 * tid; i < Br * D; i += 2 * blockDim.x){
+    const float denom = sl[i / D];
+    *reinterpret_cast<__nv_bfloat162*>(&d_O[qBase + i]) =
+        __floats2bfloat162_rn(sO[i] / denom, sO[i + 1] / denom);
+  }
+  if(tid < Br)
+    d_LSE[lBase + tid] = 0.6931471805599453f * (sm[tid] + log2f(sl[tid]));
+
+} // end of v23
+
 //* ============================
 //* Kernel Launcher
 //* ============================
@@ -5935,6 +6451,68 @@ void launch_gqa_v21(
                           B, Hq, Hkv, G, S, scale);
 }
 
+// V22 — V21 + warp specialization (gqa_v22, Bc=128): a dedicated 5th "producer" warp
+// (threads 128..159) issues this rank's key-half/head-dim-half TMA loads, decoupled
+// from the 4 "consumer" warps (threads 0..127, unchanged V21 math) via load_bar/
+// free_bar mbarriers + a named `bar.sync` — mirrors V17's exact pattern on top of
+// V21's correct cta_group::2 B-split. Same single-buffered smem footprint as V21.
+template<int Br, int Bc, int D>
+void launch_gqa_v22(
+  __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
+  __nv_bfloat16 *d_O, float *d_LSE,
+  int B, int Hq, int Hkv, int S, int G, float scale
+){
+  static_assert(Br == 128, "V22's consumer group is hardwired to 128 threads");
+  static_assert(Bc % 8 == 0, "Bc must be a multiple of 8 for tcgen05 N = 8");
+  static_assert(D  % 16 == 0, "D  must be a multiple of 16 for tcgen05 dense");
+  static_assert(Bc % 2 == 0, "Bc must be even to split the key range in half");
+  static_assert(D  % 2 == 0, "D must be even to split the head dim in half");
+
+  dim3 GRID(S/Br, Hq, B);   // x must be even (cluster dim 2 along x)
+  dim3 BLOCK(160);          // 128 consumer threads (warps 0-3) + 32 producer threads (warp 4)
+
+  static bool cfgd = false;
+  static CUtensorMap Ktmap_half, Vtmap_half;
+  if(!cfgd){
+    const uint64_t kvRows = (uint64_t)B * Hkv * S;   // K/V flattened as [B*Hkv*S, D]
+    Ktmap_half = make_tma_2d(d_K, kvRows, (uint64_t)D, (uint32_t)(Bc / 2), (uint32_t)D);
+    Vtmap_half = make_tma_2d(d_V, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)(D / 2));
+    cfgd = true;
+  }
+  gqa_v22<Br, Bc, D><<<GRID, BLOCK>>>(d_Q, d_O, d_LSE, Ktmap_half, Vtmap_half,
+                          B, Hq, Hkv, G, S, scale);
+}
+
+// V23 — V22 + double-buffered TMA staging (gqa_v23, Bc=128): ping-pong sKstage/
+// sVstage lets the producer run a full iteration ahead. sS stays fp32 (V21's N-half
+// split already freed enough smem headroom) — no V18-style precision trade needed.
+template<int Br, int Bc, int D>
+void launch_gqa_v23(
+  __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
+  __nv_bfloat16 *d_O, float *d_LSE,
+  int B, int Hq, int Hkv, int S, int G, float scale
+){
+  static_assert(Br == 128, "V23's consumer group is hardwired to 128 threads");
+  static_assert(Bc % 8 == 0, "Bc must be a multiple of 8 for tcgen05 N = 8");
+  static_assert(D  % 16 == 0, "D  must be a multiple of 16 for tcgen05 dense");
+  static_assert(Bc % 2 == 0, "Bc must be even to split the key range in half");
+  static_assert(D  % 2 == 0, "D must be even to split the head dim in half");
+
+  dim3 GRID(S/Br, Hq, B);   // x must be even (cluster dim 2 along x)
+  dim3 BLOCK(160);          // 128 consumer threads (warps 0-3) + 32 producer threads (warp 4)
+
+  static bool cfgd = false;
+  static CUtensorMap Ktmap_half, Vtmap_half;
+  if(!cfgd){
+    const uint64_t kvRows = (uint64_t)B * Hkv * S;   // K/V flattened as [B*Hkv*S, D]
+    Ktmap_half = make_tma_2d(d_K, kvRows, (uint64_t)D, (uint32_t)(Bc / 2), (uint32_t)D);
+    Vtmap_half = make_tma_2d(d_V, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)(D / 2));
+    cfgd = true;
+  }
+  gqa_v23<Br, Bc, D><<<GRID, BLOCK>>>(d_Q, d_O, d_LSE, Ktmap_half, Vtmap_half,
+                          B, Hq, Hkv, G, S, scale);
+}
+
 
 int main(){
   std::cout << "Benchmarking Grouped-Query Attention kernels — Blackwell SM_103 (B300)\n";
@@ -6384,6 +6962,36 @@ int main(){
     reportPrecision("  lse      ", h_LSE_ref.data(), h_LSE.data(),   Nlse);
     std::cout << "  O   : "; checkResult(h_O_ref.data(),   h_O_f32.data(), Nq,   2e-2f, 2e-2f);
     std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
+
+    // ── V22 : V21 + warp specialization (dedicated TMA producer warp) ──
+    launch_gqa_v22<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_LSE.data(), d_LSE, Nlse * sizeof(float),         cudaMemcpyDeviceToHost));
+
+    for(size_t i = 0; i < Nq; ++i) h_O_f32[i] = __bfloat162float(h_O[i]);
+
+    std::cout << "\nCorrectness V22 (V21 + warp-specialized TMA producer vs PyTorch bf16 SDPA):\n";
+    reportPrecision("  output O ", h_O_ref.data(),   h_O_f32.data(), Nq);
+    reportPrecision("  lse      ", h_LSE_ref.data(), h_LSE.data(),   Nlse);
+    std::cout << "  O   : "; checkResult(h_O_ref.data(),   h_O_f32.data(), Nq,   2e-2f, 2e-2f);
+    std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
+
+    // ── V23 : V22 + double-buffered TMA staging (fp32 sS, no precision trade) ──
+    launch_gqa_v23<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_O.data(),   d_O,   Nq   * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_LSE.data(), d_LSE, Nlse * sizeof(float),         cudaMemcpyDeviceToHost));
+
+    for(size_t i = 0; i < Nq; ++i) h_O_f32[i] = __bfloat162float(h_O[i]);
+
+    std::cout << "\nCorrectness V23 (V22 + double-buffered TMA staging, fp32 sS, vs PyTorch bf16 SDPA):\n";
+    reportPrecision("  output O ", h_O_ref.data(),   h_O_f32.data(), Nq);
+    reportPrecision("  lse      ", h_LSE_ref.data(), h_LSE.data(),   Nlse);
+    std::cout << "  O   : "; checkResult(h_O_ref.data(),   h_O_f32.data(), Nq,   2e-2f, 2e-2f);
+    std::cout << "  LSE : "; checkResult(h_LSE_ref.data(), h_LSE.data(),   Nlse, 2e-2f, 2e-2f);
   }
 
   //* ── Benchmark ──────────────────────────────────────────────────────────
@@ -6526,6 +7134,18 @@ int main(){
     100, 25, flops, bytes
   );
   displayStats("V21 — V20 + genuine N-half split B operand (fp32 sS)", stats_v21);
+
+  KernelStats stats_v22 = benchmarkKernel(
+    [&](){ launch_gqa_v22<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
+    100, 25, flops, bytes
+  );
+  displayStats("V22 — V21 + warp specialization (dedicated TMA producer warp)", stats_v22);
+
+  KernelStats stats_v23 = benchmarkKernel(
+    [&](){ launch_gqa_v23<Br_128, Bc_128, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
+    100, 25, flops, bytes
+  );
+  displayStats("V23 — V22 + double-buffered TMA staging (fp32 sS, no precision trade)", stats_v23);
 
   CUDA_CHECK(cudaFree(d_Q));
   CUDA_CHECK(cudaFree(d_K));
