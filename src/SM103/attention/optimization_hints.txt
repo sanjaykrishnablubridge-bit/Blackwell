@@ -1,45 +1,27 @@
-Here's the concrete list of optimizations I can identify from the instruction stream, grouped by category:
-1. 2-CTA Cluster / Cooperative Grid Array (CGA) execution
-
-CS2R.32 SR_CgaSize, UCGABAR_ARV / UCGABAR_WAIT, SR_CgaCtaId — the kernel launches CTA pairs as a cluster (Blackwell's paired-CTA MMA mode) and uses cluster-level barriers to synchronize the two CTAs before/after shared MMA work.
-UTCHMMA.2CTA (every single MMA in this kernel is the 2-CTA variant) — confirms the QKᵀ and PV matmuls are done as a single logical MMA spanning both CTAs in the cluster, doubling effective tile size/throughput per MMA issue versus 1-SM mode.
-
-2. Warp specialization with dynamic register repartitioning
-
-USETMAXREG.TRY_ALLOC.CTAPOOL UP0, 0xc0 then later USETMAXREG.DEALLOC.CTAPOOL 0x58 / 0x28 — this is the producer/consumer warpgroup pattern: MMA-consumer warps grab up to 192 registers, while TMA-producer and softmax/epilogue warps give back down to 40/88. This is the standard Hopper/Blackwell trick to avoid register pressure limiting occupancy when different warpgroups do very different work (pure async copy vs. heavy MMA/softmax math).
-Distinct code regions guarded by WARPSYNC.ALL and warp-id predicates (ISETP on SR_TID.X ranges like 0x80, 0xff) — clean separation of producer warps (TMA issue), MMA warps, and softmax/correction warps.
-
-3. TMA (Tensor Memory Accelerator) async loads
-
-UTMALDG.4D.2CTA — 4D tensor loads issued once and multicast to both CTAs of the cluster (.2CTA), meaning K/V tiles are fetched from HBM once and shared across the pair rather than duplicated — direct GQA/cluster bandwidth saving.
-Paired with SYNCS.ARRIVE.TRANS64 / SYNCS.PHASECHK.TRANS64.TRYWAIT mbarrier machinery for producer→consumer handoff (async-copy-then-wait, no polling stalls).
-
-4. Tensor Memory (TMEM) as the accumulator, not registers
-
-LDTM.x32 / STTM.x16 — the QKᵀ (and PV) MMA accumulators live in dedicated Tensor Memory, not the register file. Softmax math reads straight out of TMEM (LDTM) and rescaled/corrected values are written back (STTM) — this is the Blackwell tcgen05 model, and it's what frees up the register budget point above.
-$__cuda_sm10x_tcgen05_guardrail_trap_* calls — compiler-inserted runtime guardrails for TMEM allocation/deallocation correctness (alloc/dealloc phase checks). This tells you the kernel is doing manual/fine-grained TMEM buffer alloc-dealloc cycling (double-buffered TMEM tiles), not a single static allocation.
-
-5. Online softmax, fused and numerically tuned
-
-FMNMX3.FTZ (three-way min/max in one instruction) used repeatedly to compute the running row-max over groups of accumulator elements — classic online-softmax max-tracking, done at 3-wide granularity for instruction efficiency.
-FMUL.FTZ ... 1.4426950216293334961 = log2(e) — logits are pre-scaled by log2(e) so that…
-MUFU.EX2 (hardware base-2 exponential unit) is used instead of MUFU.EX for the exp() in softmax — this is the well-known "compute exp2 instead of exp" trick (avoids an extra multiply-by-log2e per element inside the transcendental, and EX2 is the native SFU op) — used almost 100 times, i.e. applied per-accumulator-element across the whole tile.
-FSETP.NEU.FTZ.AND ... -INF — explicit -∞ initialization/check for the running max register, standard flash-attention safe-softmax init.
-Rescaling of the O accumulator and running sum by the max-correction factor is interleaved with the MMA epilogue rather than done as a separate pass.
-
-6. Output precision handling
-
-F2FP.BF16.F32.PACK_AB (~128 occurrences) — final softmax-probabilities / output values are computed in FP32 internally then packed down to BF16 pairs for the PV matmul input and/or output write. This is deliberate mixed precision: FP32 accuracy for the softmax reduction, BF16 for the tensor-core matmul operand and/or HBM write to save bandwidth.
-
-7. Shared memory staging for the P matrix (softmax probs → PV operand)
-
-STS.128 writes of the packed BF16 probabilities into shared memory — the probability tile is never round-tripped to HBM; it goes MMA accumulator (TMEM) → softmax math (registers) → shared memory → immediately consumed as the "A" operand of the second MMA (UTCHMMA.2CTA again). This is the fused FlashAttention structure I mentioned earlier, confirmed at the instruction level.
-
-8. Lock-free synchronization via warp-aggregated atomics
-
-REDUX (warp-wide reduction op) combined with ATOMS.OR / ATOMS.XOR / ATOMS.AND on small counters — used for lightweight cross-CTA/cross-warp signaling (likely tile-scheduling/work-queue bits for the persistent kernel's next-tile dispatch, or barrier phase-bit toggling), rather than a full mbarrier for cheap bookkeeping.
-UTCATOMSWS.2CTA.FIND_AND_SET.ALIGN / UTCATOMSWS.AND — TMEM-allocator-specific atomic find-and-set, i.e. the runtime TMEM buffer slot allocator for double/multi-buffering MMA accumulator tiles across iterations.
-
-9. Persistent kernel / dynamic scheduling
-
-Early code computes CTAID.X/Y/Z against grid dimension uniforms (UR38/UR39) with division-like float reciprocal tricks (I2FP→FMUL→F2I) to derive a linearized/remapped tile index — a strong signature of a persistent kernel doing software tile-index remapping (e.g. swizzled or work-stealing tile assignment) rather than a 1:1 CTA-to-tile grid launch.
+What the profile actually says
+1. You are barrier-bound, not memory- or math-bound. Warp State shows ~7.6 of 13.3 cycles/instruction in Stall Barrier (Nsight's estimated local speedup: 57%). Eligible warps per scheduler is 0.34, issued 0.30, and 69.9% of cycles have no eligible warp. cuDNN's dominant stall is Long Scoreboard (normal for a pipelined memory kernel); yours is bar.sync. All 512 threads are repeatedly meeting at CTA-wide __syncthreads().
+2. You're moving the attention matrix through shared memory; cuDNN isn't. Shared loads: 1.05B instructions (+2,100,000% vs cuDNN — cuDNN has essentially none), shared stores 644M. LSU is your hottest pipe (31.65%, +3,788% vs cuDNN) while your Tensor pipe sits at 4.76% vs cuDNN's ~50%, and TMEM utilization ~6% vs ~52%. You are using tcgen05 MMA (utchmma bf16→fp32 shows 2.1e12 ops) but achieving ~10% of cuDNN's MMA ops/cycle. The tensor cores are starved by smem round-trips and barriers.
+3. The smem traffic you do have is conflicted. 27.6% of shared-load wavefronts hit bank conflicts (40.1M conflicts, est. 12.5% speedup), 10.3% of stores (est. 4.6%). Uncoalesced shared accesses: 19% excessive wavefronts (est. 18%), pinpointed at lines 5369–5370. Notably, Shared Load Matrix = 0 — you're not using ldmatrix/stmatrix at all.
+4. Instruction bloat. 6.2B executed instructions, +438% vs cuDNN for the same problem. Integer (address math) and Load/Store dominate. 104M non-fused FP32 FADDs at lines 5483–5487 (est. 4.6% from FFMA fusion). Avg divergent branches +62,689% — the causal mask is being handled with per-element branches. Warp-stall sampling puts 51% of all samples on line 5411 (almost certainly your barrier/wait).
+5. HBM is irrelevant here. DRAM throughput 0.42%, L2 hit rate 91%+. Also: 786K plain global loads and 405K global stores exist that cuDNN doesn't have (cuDNN is 100% TMA), and occupancy is capped at 1 CTA/SM by the 232 KB smem (25% theoretical = achieved, so occupancy per se isn't the killer — the dead time within the CTA is).
+Experiment plan (in order of expected payoff)
+None of these change numerics meaningfully: keep bf16 inputs, fp32 accumulation, fp32 softmax with max-subtraction throughout.
+Experiment 1 — Warp specialization + mbarrier pipeline (targets the 57% barrier stall).
+Split the 512 threads into roles: 1 producer warp(group) issuing TMA loads for K/V tiles, 1 warp driving tcgen05.mma (on Blackwell a single thread can launch the MMA), and consumer warpgroups doing softmax/correction. Replace every CTA-wide __syncthreads() with mbarrier arrive/wait pairs (producer→consumer full/empty semantics) and named barriers scoped to a warpgroup where intra-group sync is needed. Build a 2–4 stage circular buffer for KV tiles so TMA of tile i+2 overlaps MMA of tile i+1 and softmax of tile i. This is the single biggest lever — it's what turns the green cuDNN profile shape (long-scoreboard-dominated) from your blue one (barrier-dominated). Verify with: Stall Barrier cycles/inst, Issued warp/scheduler, Tensor pipe %.
+Experiment 2 — Eliminate the S/P smem round-trip (targets the 1.05B LDS / 31% LSU pipe).
+The score matrix S = QKᵀ lands in TMEM on sm_10x. Read it with tcgen05.ld straight into registers, do the row-max/exp/row-sum entirely in registers (warp-shuffle reductions for the row statistics rather than smem reductions), and feed P back to the second MMA without staging it through shared memory (tcgen05.st to TMEM, or if your P·V path consumes from smem, write with stmatrix in the exact swizzled layout the MMA descriptor expects). Every STS/LDS of S/P you remove kills LSU work and a barrier. This plus Experiment 1 is essentially the FA3/FA4-style Blackwell design cuDNN implements. Verify with: Shared Load/Store instruction counts (should drop by orders of magnitude), LSU pipe %.
+Experiment 3 — Swizzle the remaining shared memory (targets 40M bank conflicts, lines 5369–5370).
+For the KV staging buffers, use the TMA 128B swizzle mode and matching MMA smem descriptors so tiles are loaded and consumed conflict-free; for anything hand-indexed, apply XOR-swizzled layouts (or ldmatrix, currently unused) instead of padding. Cheap to do, ~12–18% by Nsight's own estimate. Verify: L1 Wavefronts Shared Excessive at those two lines → ~0.
+Experiment 4 — Fuse the softmax arithmetic (lines 5483–5487).
+Rewrite the rescale/accumulate as FFMA: fold the 1/ln2 scale into the QK scale so exp becomes exp2f(fma(s, scale_log2e, -m*scale_log2e)), and the running-output correction as o = fma(o, alpha, p*v) style updates. Use exp2f → MUFU.EX2 on the XU pipe (note cuDNN's XU utilization is ~46% vs your ~6% — theirs is spending its "FP32" budget on EX2, yours on unfused FADDs). Max-subtraction stays, so numerical stability is unchanged; only ULP-level rounding order differs, precision class (fp32) is identical. Est. ~5% alone, more once instruction count matters post-Exp-1/2.
+Experiment 5 — Predicated causal masking + tile-level skipping.
+Replace per-element if masking with branchless select (s = mask ? s : -inf compiled to predication, or add a precomputed −inf bias tile), skip entirely-masked KV tiles before issuing their TMA/MMA at all, and only run the masking code on the single diagonal tile per row-block. This removes the divergent branches and a chunk of the integer/control instruction bloat. Also rebalance the grid: with causal, diagonal blocks do variable work — schedule row-blocks so long and short rows mix per SM (or see Exp 7).
+Experiment 6 — Kill the residual non-TMA global traffic.
+You still issue 786K global loads and 405K global stores. Move the O writeback to cp.async.bulk.tensor (TMA store, ideally from smem staging written with stmatrix), and route whatever the global loads are (seq-length metadata, head pointers) through constant/uniform loads or fold them into TMA descriptors. cuDNN's profile has zero of these.
+Experiment 7 — Launch-shape experiments (cheap A/B tests).
+(a) 1536 CTAs / 148 SMs = 10.4 waves — try a persistent kernel with an atomic tile counter to remove wave quantization and improve causal load balance (Nsight shows ~5.4% imbalance). (b) Try cluster size 2 with tcgen05 MMA cta_group::2 so a CTA pair shares one larger MMA and K/V smem via DSMEM — halves per-CTA smem loads and doubles effective tile size. (c) After Exp 2 shrinks smem needs, test ≤116 KB/block so 2 CTAs/SM fit (32 warps/SM) vs today's 1 — with a proper pipeline this may not matter, but it's a one-line test. (d) You're at 64 regs/thread with 25% occupancy headroom; cuDNN uses 128. Raise __launch_bounds__/maxrregcount to 128 and keep the softmax state in registers — you're currently paying smem traffic to compensate for registers you aren't using.
+Experiment 8 — Instruction diet.
+After the structural fixes, attack the +438% instruction count: hoist loop-invariant address math out of the KV loop, use the uniform datapath (UR registers) for per-CTA-constant addressing, precompute TMA/MMA descriptors once, and unroll the inner loop with compile-time offsets. Check Executed Instructions converges toward cuDNN's.
+How I'd sequence it
+Do 3 and 4 first (days, low risk, ~15–20% combined) to build measurement discipline, then 1+2 together since they're one architectural change (the warp-specialized TMEM-resident pipeline) — that's where the bulk of the 9.4× gap closes, because it converts barrier-idle cycles into tensor-pipe cycles. Then 5, 6, 7, 8 as tuning passes. After each step, re-profile and watch four numbers: Stall Barrier (→ under ~1 cycle/inst), Tensor pipe % (→ 40–50%), Shared Load instructions (→ near zero), Issued warp/scheduler (→ 0.6+). For precision, keep a fixed test harness comparing against an fp64 reference with max-abs and RMS error per head — expressed that way, every change above should sit inside the same error envelope you have today, since accumulation precision, softmax stability trick, and datatypes are all untouched.
+One caveat: exact line-level fixes (5369–5370, 5411, 5483–5487) assume the source correlation in the report maps to your v34 source; if you can share those regions of the kernel, I can suggest the specific rewrites rather than the patterns.

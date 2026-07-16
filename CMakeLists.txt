@@ -80,6 +80,10 @@ foreach(SOURCE ${KERNEL_SOURCES})
     if(NAME STREQUAL "deviceSpecs" AND NVML_LIB)
         target_link_libraries(${NAME} PRIVATE ${NVML_LIB})
     endif()
+    if(NAME STREQUAL "fa4_style_gqa_sm103")
+        # File defaults HEAD_DIM to 128; this project's actual problem shape is D=64.
+        target_compile_definitions(${NAME} PRIVATE HEAD_DIM=64)
+    endif()
     set_target_properties(${NAME} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
