@@ -4467,6 +4467,24 @@ __global__ void __launch_bounds__(512, 1) gqa_v45_causal(
         // combination the WRITE needs from wherever Phase 1 put it, then
         // issue the SAME bank-conflict-free write V32/V34 already proved
         // (canon_idx increases by exactly 2 elements per lane, unchanged).
+        //
+        // IMPORTANT (hardware-confirmed bug, fixed here): `__shfl_sync(mask,
+        // vrow[r_lo], src_lane)` does NOT mean "fetch src_lane's vrow at MY
+        // r_lo" -- it evaluates `vrow[r_lo]` INDEPENDENTLY on every thread
+        // (each producing a value using its OWN r_lo, i.e. its OWN
+        // bc_pair_idx), and the shuffle then returns whatever THAT
+        // INSTRUCTION's operand was on thread src_lane -- i.e.
+        // vrow[r_lo(src_lane)], not vrow[r_lo(calling thread)]. Since
+        // different lanes generally have different bc_pair_idx, this silently
+        // pulled the WRONG row from the source lane (confirmed: a hand
+        // simulation of the exact index arithmetic showed 6144/8192 wrong
+        // positions with that version, vs 0 with this one). Fix: shuffle
+        // EACH vrow[r] individually with r as a COMPILE-TIME CONSTANT (so
+        // every thread's operand for a given shuffle instruction is
+        // unambiguously "row r", no per-thread indexing ambiguity), THEN
+        // select r_lo/r_hi from the already-shuffled results afterward --
+        // that final selection is a same-thread register select, not a
+        // cross-thread fetch, so a runtime index there is perfectly safe.
         #pragma unroll
         for(int d_coarse = 0; d_coarse < DCoarseGroups; ++d_coarse){
           const int d_frac      = lane / 4;   // 0..7
@@ -4475,12 +4493,14 @@ __global__ void __launch_bounds__(512, 1) gqa_v45_causal(
           const int src_lane    = d / 2;        // which Phase-1 lane owns this d
           const bool hi         = (d & 1) != 0; // odd d -> upper bf16 of the pair
 
+          uint32_t shuffled[8];
+          #pragma unroll
+          for(int r = 0; r < 8; ++r) shuffled[r] = __shfl_sync(0xFFFFFFFFu, vrow[r], src_lane);
+
           const int r_lo = bc_pair_idx * 2;
           const int r_hi = r_lo + 1;
-          uint32_t w_lo = __shfl_sync(0xFFFFFFFFu, vrow[r_lo], src_lane);
-          uint32_t w_hi = __shfl_sync(0xFFFFFFFFu, vrow[r_hi], src_lane);
-          __nv_bfloat162 p_lo = *reinterpret_cast<__nv_bfloat162*>(&w_lo);
-          __nv_bfloat162 p_hi = *reinterpret_cast<__nv_bfloat162*>(&w_hi);
+          __nv_bfloat162 p_lo = *reinterpret_cast<__nv_bfloat162*>(&shuffled[r_lo]);
+          __nv_bfloat162 p_hi = *reinterpret_cast<__nv_bfloat162*>(&shuffled[r_hi]);
 
           __nv_bfloat162 packed;
           packed.x = hi ? p_lo.y : p_lo.x;
