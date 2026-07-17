@@ -635,7 +635,7 @@ __device__ __forceinline__ uint64_t make_smem_desc_mnV_sw128(void* smem_ptr){
                 | (1ull << 16)                    // LBO encoded = 1  [VERIFY-2]
                 | (desc_encode(1024ull) << 32)    // SBO = 1024 B
                 | (1ull << 46)                    // valid bit (same as make_smem_desc)
-                | (1ull << 61);                   // swizzle mode 1 = 128B [VERIFY-2]
+                | (2ull << 61);                   // swizzle mode 1 = 128B [VERIFY-2]
   return desc;
 }
 
