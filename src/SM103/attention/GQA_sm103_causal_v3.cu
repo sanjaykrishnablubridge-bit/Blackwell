@@ -1794,6 +1794,392 @@ void launch_gqa_v48_causal(
                                                B, Hq, Hkv, G, S, scale);
 }
 
+
+// =============================================================================
+//  gqa_v49_causal -- V48 + double-buffered S in TMEM + early QK^T issue.
+//  See file header for the full delta description.
+// =============================================================================
+template<int Br, int Bc, int D>
+__global__ void __launch_bounds__(160, 1) gqa_v49_causal(
+  __nv_bfloat16 *d_O,
+  float *d_LSE,
+  const __grid_constant__ CUtensorMap Qtmap,
+  const __grid_constant__ CUtensorMap Ktmap,
+  const __grid_constant__ CUtensorMap Vtmap,
+  int B, int Hq, int Hkv, int G, int S, float scale
+){
+  static_assert(Br == 128, "consumer group is hardwired to 128 threads");
+  static_assert(Br == Bc,  "causal tile-skip + diagonal-tile mask requires Br == Bc");
+  static_assert(D == 64,   "SW128 Q/K/V descriptor constants assume D = 64 (one 128B span)");
+
+  const int tid = threadIdx.x;          // 0..127 compute, 128..159 producer.
+
+  const int nTiles     = S / Br;
+  const int pairsPerBH = nTiles / 2;
+  const int idx  = blockIdx.x;
+  const int b    = idx / (Hq * pairsPerBH);
+  const int rem  = idx - b * (Hq * pairsPerBH);
+  const int hq   = rem / pairsPerBH;
+  const int pair = rem - hq * pairsPerBH;
+  const int hkv  = hq / G;
+  const int kvRow0 = (b * Hkv + hkv) * S;
+
+  const float scale_l2e = scale * 1.4426950408889634f;
+
+  __shared__ __align__(1024) __nv_bfloat16 sQ[Br * D];         // SW128 now (was atom-native canon_idx)
+  __shared__ __align__(1024) __nv_bfloat16 sK[2][Bc * D];
+  __shared__ __align__(1024) __nv_bfloat16 sVstage[2][Bc * D];
+  __shared__ float sl[Br];
+  __shared__ __align__(8) uint64_t s_qk_bar[2];   // per-S-slot QK^T completion (was s_mma_bar)
+  __shared__ __align__(8) uint64_t s_pv_bar;      // PV completion (single, reused)
+  __shared__ __align__(8) uint64_t s_load_bar_K[2], s_free_bar_K[2];
+  __shared__ __align__(8) uint64_t s_load_bar_V[2], s_free_bar_V[2];
+  __shared__ __align__(8) uint64_t s_load_bar_Q;
+
+  const uint32_t qkbar0 = (uint32_t)__cvta_generic_to_shared(&s_qk_bar[0]);
+  const uint32_t qkbar1 = (uint32_t)__cvta_generic_to_shared(&s_qk_bar[1]);
+  const uint32_t pv_bar = (uint32_t)__cvta_generic_to_shared(&s_pv_bar);
+  const uint32_t lbarK0  = (uint32_t)__cvta_generic_to_shared(&s_load_bar_K[0]);
+  const uint32_t lbarK1  = (uint32_t)__cvta_generic_to_shared(&s_load_bar_K[1]);
+  const uint32_t fbarK0  = (uint32_t)__cvta_generic_to_shared(&s_free_bar_K[0]);
+  const uint32_t fbarK1  = (uint32_t)__cvta_generic_to_shared(&s_free_bar_K[1]);
+  const uint32_t lbarV0  = (uint32_t)__cvta_generic_to_shared(&s_load_bar_V[0]);
+  const uint32_t lbarV1  = (uint32_t)__cvta_generic_to_shared(&s_load_bar_V[1]);
+  const uint32_t fbarV0  = (uint32_t)__cvta_generic_to_shared(&s_free_bar_V[0]);
+  const uint32_t fbarV1  = (uint32_t)__cvta_generic_to_shared(&s_free_bar_V[1]);
+  const uint32_t qbar    = (uint32_t)__cvta_generic_to_shared(&s_load_bar_Q);
+
+  constexpr uint32_t TMEM_S0_COL   = 0;                          // S slot 0: [0,128)
+  constexpr uint32_t TMEM_S1_COL   = (uint32_t)Bc;               // S slot 1: [128,256)
+  constexpr uint32_t TMEM_O_COL    = 2u * (uint32_t)Bc;          // O: [256,320)
+  constexpr uint32_t TMEM_P_COL    = TMEM_O_COL + (uint32_t)D;   // packed P: [320,384)
+  constexpr uint32_t TMEM_M_COL    = TMEM_P_COL + (uint32_t)Bc/2;// 384
+  constexpr uint32_t TMEM_CORR_COL = TMEM_M_COL + 1;             // 385
+  constexpr uint32_t NCOLS = 512;   // was 256 -- first hardware use of a full
+                                    // 512-col allocation in this codebase
+
+  uint32_t tmem_addr;
+  {
+    __shared__ uint32_t s_tmem_addr;
+    if(tid < 32){
+      uint32_t s_addr = (uint32_t)__cvta_generic_to_shared(&s_tmem_addr);
+      asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                   :: "r"(s_addr), "r"(NCOLS) : "memory");
+      asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+    }
+    __syncthreads();
+    tmem_addr = s_tmem_addr;
+  }
+
+  const int warp_id_c = tid / 32;
+  const uint32_t lane_base_c = (uint32_t)warp_id_c * 32u;
+  auto tmem_ld32 = [&](uint32_t col, float* r){
+    asm volatile(
+      "tcgen05.ld.sync.aligned.32x32b.x32.b32 "
+      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
+      "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, [%32];"
+      : "=f"(r[0]),"=f"(r[1]),"=f"(r[2]),"=f"(r[3]),"=f"(r[4]),"=f"(r[5]),
+        "=f"(r[6]),"=f"(r[7]),"=f"(r[8]),"=f"(r[9]),"=f"(r[10]),"=f"(r[11]),
+        "=f"(r[12]),"=f"(r[13]),"=f"(r[14]),"=f"(r[15]),"=f"(r[16]),"=f"(r[17]),
+        "=f"(r[18]),"=f"(r[19]),"=f"(r[20]),"=f"(r[21]),"=f"(r[22]),"=f"(r[23]),
+        "=f"(r[24]),"=f"(r[25]),"=f"(r[26]),"=f"(r[27]),"=f"(r[28]),"=f"(r[29]),
+        "=f"(r[30]),"=f"(r[31])
+      : "r"(tmem_addr + (lane_base_c << 16) + col));
+  };
+  auto tmem_st32 = [&](uint32_t col, const uint32_t* r){
+    asm volatile(
+      "tcgen05.st.sync.aligned.32x32b.x32.b32 [%32], "
+      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
+      "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31};"
+      :: "r"(r[0]),"r"(r[1]),"r"(r[2]),"r"(r[3]),"r"(r[4]),"r"(r[5]),
+         "r"(r[6]),"r"(r[7]),"r"(r[8]),"r"(r[9]),"r"(r[10]),"r"(r[11]),
+         "r"(r[12]),"r"(r[13]),"r"(r[14]),"r"(r[15]),"r"(r[16]),"r"(r[17]),
+         "r"(r[18]),"r"(r[19]),"r"(r[20]),"r"(r[21]),"r"(r[22]),"r"(r[23]),
+         "r"(r[24]),"r"(r[25]),"r"(r[26]),"r"(r[27]),"r"(r[28]),"r"(r[29]),
+         "r"(r[30]),"r"(r[31]), "r"(tmem_addr + (lane_base_c << 16) + col));
+  };
+  auto tmem_ld_scalar = [&](uint32_t col, float &a){
+    asm volatile("tcgen05.ld.sync.aligned.32x32b.x1.b32 {%0}, [%1];"
+                 : "=f"(a) : "r"(tmem_addr + (lane_base_c << 16) + col));
+  };
+  auto tmem_st_scalar = [&](uint32_t col, float v){
+    asm volatile("tcgen05.st.sync.aligned.32x32b.x1.b32 [%1], {%0};"
+                 :: "f"(v), "r"(tmem_addr + (lane_base_c << 16) + col));
+  };
+  auto tmem_wait_ld = [](){ asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory"); };
+  auto tmem_wait_st = [](){ asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory"); };
+
+  const uint32_t TX = (uint32_t)Bc * (uint32_t)D * (uint32_t)sizeof(__nv_bfloat16);
+  const uint32_t sK_addr0      = (uint32_t)__cvta_generic_to_shared(sK[0]);
+  const uint32_t sK_addr1      = (uint32_t)__cvta_generic_to_shared(sK[1]);
+  const uint32_t sVstage_addr0 = (uint32_t)__cvta_generic_to_shared(sVstage[0]);
+  const uint32_t sVstage_addr1 = (uint32_t)__cvta_generic_to_shared(sVstage[1]);
+  const uint32_t sQ_addr       = (uint32_t)__cvta_generic_to_shared(sQ);
+
+  for(int pass = 0; pass < 2; ++pass){
+    const int q_tile   = (pass == 0) ? pair : (nTiles - 1 - pair);
+    const int q_row0   = q_tile * Br;
+    const int nKVTiles = q_tile + 1;
+
+    const long qBase = ((long)(b * Hq + hq) * S + q_row0) * D;
+    const long lBase = ((long)(b * Hq + hq) * S + q_row0);
+
+    if(tid < Br){
+      tmem_st_scalar(TMEM_M_COL, -INFINITY);
+      tmem_wait_st();
+      asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+      sl[tid] = 0.0f;
+    }
+
+    if(tid == 0){
+      mbar_init(qkbar0, 1); mbar_init(qkbar1, 1);
+      mbar_init(pv_bar, 1);
+      mbar_init(lbarK0, 1); mbar_init(lbarK1, 1);
+      mbar_init(fbarK0, 1); mbar_init(fbarK1, 1);
+      mbar_init(lbarV0, 1); mbar_init(lbarV1, 1);
+      mbar_init(fbarV0, 1); mbar_init(fbarV1, 1);
+      mbar_init(qbar, 1);
+      mbar_expect_tx(qbar, TX);
+      tma_load_2d(sQ_addr, &Qtmap, 0, (int)((b * Hq + hq) * S + q_row0), qbar);   // was tma_load_3d
+      mbar_arrive(qbar);
+    }
+    __syncthreads();
+
+    if(tid >= 128){
+      // ---- Producer warp: unchanged from V47. ----
+      if(tid == 128){
+        int free_phase_K_bits = 0, free_phase_V_bits = 0;
+        for(int kc = 0; kc < nKVTiles; ++kc){
+          const int slot = kc & 1;
+          const uint32_t cur_lbarK = (slot == 0) ? lbarK0 : lbarK1;
+          const uint32_t cur_fbarK = (slot == 0) ? fbarK0 : fbarK1;
+          const uint32_t cur_lbarV = (slot == 0) ? lbarV0 : lbarV1;
+          const uint32_t cur_fbarV = (slot == 0) ? fbarV0 : fbarV1;
+          const uint32_t cur_sK_addr      = (slot == 0) ? sK_addr0      : sK_addr1;
+          const uint32_t cur_sVstage_addr = (slot == 0) ? sVstage_addr0 : sVstage_addr1;
+          if(kc >= 2){
+            mbar_wait_spin(cur_fbarK, (free_phase_K_bits >> slot) & 1); free_phase_K_bits ^= (1 << slot);
+            mbar_wait_spin(cur_fbarV, (free_phase_V_bits >> slot) & 1); free_phase_V_bits ^= (1 << slot);
+          }
+          const int r = kvRow0 + kc * Bc;
+          mbar_expect_tx(cur_lbarK, TX);
+          tma_load_2d(cur_sK_addr, &Ktmap, 0, r, cur_lbarK);
+          mbar_arrive(cur_lbarK);
+          mbar_expect_tx(cur_lbarV, TX);
+          tma_load_2d(cur_sVstage_addr, &Vtmap, 0, r, cur_lbarV);
+          mbar_arrive(cur_lbarV);
+        }
+      }
+    } else {
+      // ---- Compute group (tid < 128) ----
+      int qk_phase_bits = 0;                 // per-slot phase for qk_bar[2]
+      int pv_phase = 0;
+      int load_phase_K_bits = 0, load_phase_V_bits = 0;   // used by tid==0 only now
+      mbar_wait_spin(qbar, 0);
+      const uint64_t descQ_base = make_smem_desc_mnV_sw128(sQ);
+      const uint32_t idescQK = make_idesc_bf16(Br, Bc);
+      const uint32_t idescPV = make_idesc_bf16_bMN(Br, D);
+
+      // QK^T(tile) -> S[tile&1]. tid==0 only. Caller has already waited
+      // lbarK[tile&1] and issued the async-proxy fence.
+      auto issue_qk = [&](int tile){
+        const int s = tile & 1;
+        const uint32_t dst = tmem_addr + ((s == 0) ? TMEM_S0_COL : TMEM_S1_COL);
+        const uint64_t descK_base = make_smem_desc_mnV_sw128(sK[s]);
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        for(int kt = 0; kt < D/16; ++kt){
+          uint64_t descQ = advance_desc_katom_kmajor_sw128(descQ_base, kt);
+          uint64_t descK = advance_desc_katom_kmajor_sw128(descK_base, kt);
+          uint32_t accumulate = (kt > 0) ? 1u : 0u;
+          asm volatile(
+            "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
+            :: "r"(dst), "l"(descQ), "l"(descK), "r"(idescQK), "r"(accumulate) : "memory");
+        }
+        // Commit BEFORE PV(tile-1) is issued: snapshots only this QK^T
+        // (everything issued earlier has already been waited on).
+        mbar_commit_mma((s == 0) ? qkbar0 : qkbar1);
+      };
+
+      // Prologue: get QK^T(0) in flight before entering the loop.
+      if(tid == 0){
+        mbar_wait_spin(lbarK0, (load_phase_K_bits >> 0) & 1);
+        load_phase_K_bits ^= 1;
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        issue_qk(0);
+      }
+
+      for(int kc = 0; kc < nKVTiles; ++kc){
+        const int slot = kc & 1;
+        const uint32_t cur_qkbar = (slot == 0) ? qkbar0 : qkbar1;
+        const uint32_t cur_fbarK = (slot == 0) ? fbarK0 : fbarK1;
+        const uint32_t cur_fbarV = (slot == 0) ? fbarV0 : fbarV1;
+        const uint32_t S_col     = (slot == 0) ? TMEM_S0_COL : TMEM_S1_COL;
+
+        float s_row[Bc];
+
+        { // ---- consume S = Q @ K^T (issued one iteration -- or prologue -- ago) ----
+          mbar_wait_spin(cur_qkbar, (qk_phase_bits >> slot) & 1); qk_phase_bits ^= (1 << slot);
+          if(tid == 0) mbar_arrive(cur_fbarK);           // K[slot] consumed
+
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          #pragma unroll
+          for(int c = 0; c < Bc; c += 32) tmem_ld32(S_col + (uint32_t)c, &s_row[c]);
+          tmem_wait_ld();
+
+          // Early-issue QK^T(kc+1) into the other S slot: from here on the
+          // tensor cores compute tile kc+1's scores UNDER softmax(kc).
+          // Writing S[1-slot] is safe: its previous contents (tile kc-1's
+          // scores) were fully read by all warps before iteration kc-1's
+          // first consumer_sync.
+          if(tid == 0 && kc + 1 < nKVTiles){
+            const int ns = 1 - slot;
+            mbar_wait_spin((ns == 0) ? lbarK0 : lbarK1, (load_phase_K_bits >> ns) & 1);
+            load_phase_K_bits ^= (1 << ns);
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            issue_qk(kc + 1);
+          }
+
+          if(kc == q_tile){
+            #pragma unroll
+            for(int j = 0; j < Bc; ++j) if(j > tid) s_row[j] = -INFINITY;
+          }
+          consumer_sync();
+        }
+
+        { // ---- softmax: identical math to V48; packed P now goes to its own
+          //      fixed TMEM region (P last read by PV(kc-1), already waited) ----
+          asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          float m_old;
+          tmem_ld_scalar(TMEM_M_COL, m_old);
+          tmem_wait_ld();
+          const float l_old = sl[tid];
+
+          float tile_max = -INFINITY;
+          #pragma unroll
+          for(int c = 0; c < Bc; ++c) tile_max = fmaxf(tile_max, s_row[c]);
+
+          const float m_new = fmaxf(m_old, tile_max);
+          const float corr  = ex2_approx((m_old - m_new) * scale_l2e);
+          const float neg_max_scaled = -m_new * scale_l2e;
+
+          float p_sum = 0.0f;
+          uint32_t p_packed[Bc / 2];
+          #pragma unroll
+          for(int j2 = 0; j2 < Bc; j2 += 2){
+            const float p0 = ex2_approx(fmaf(s_row[j2],     scale_l2e, neg_max_scaled));
+            const float p1 = ex2_approx(fmaf(s_row[j2 + 1], scale_l2e, neg_max_scaled));
+            __nv_bfloat162 hp = __floats2bfloat162_rn(p0, p1);
+            p_packed[j2 / 2] = *reinterpret_cast<uint32_t*>(&hp);
+            p_sum += p0 + p1;
+          }
+
+          tmem_st_scalar(TMEM_M_COL, m_new);
+          tmem_wait_st();
+          #pragma unroll
+          for(int c = 0; c < Bc / 2; c += 32) tmem_st32(TMEM_P_COL + (uint32_t)c, &p_packed[c]);
+          tmem_wait_st();
+
+          if(kc > 0){
+            float o_row[D];
+            #pragma unroll
+            for(int c = 0; c < D; c += 32) tmem_ld32(TMEM_O_COL + (uint32_t)c, &o_row[c]);
+            tmem_wait_ld();
+            #pragma unroll
+            for(int c = 0; c < D; ++c) o_row[c] *= corr;
+            #pragma unroll
+            for(int c = 0; c < D; c += 32)
+              tmem_st32(TMEM_O_COL + (uint32_t)c, reinterpret_cast<const uint32_t*>(&o_row[c]));
+            tmem_wait_st();
+          }
+          asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+
+          sl[tid] = l_old * corr + p_sum;
+        }
+        consumer_sync();
+
+        { // ---- O += P @ V, P read from its fixed region ----
+          if(tid == 0){
+            mbar_wait_spin((slot == 0) ? lbarV0 : lbarV1, (load_phase_V_bits >> slot) & 1);
+            load_phase_V_bits ^= (1 << slot);
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            const uint64_t descV_base = make_smem_desc_mnV_sw128(sVstage[slot]);
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            for(int kt = 0; kt < Bc/16; ++kt){
+              uint64_t descV = advance_desc_katom_mnV(descV_base, kt);
+              uint32_t p_operand_addr = tmem_addr + TMEM_P_COL + (uint32_t)(kt * 8);
+              uint32_t accumulate = (kc > 0 || kt > 0) ? 1u : 0u;
+              asm volatile(
+                "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+                "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, p;\n\t}\n"
+                :: "r"(tmem_addr + TMEM_O_COL), "r"(p_operand_addr), "l"(descV), "r"(idescPV), "r"(accumulate) : "memory");
+            }
+            // This commit also sweeps in the possibly-still-running
+            // QK^T(kc+1) -- see file header; conservative but correct.
+            mbar_commit_mma(pv_bar);
+          }
+          mbar_wait_spin(pv_bar, pv_phase); pv_phase ^= 1;
+          if(tid == 0) mbar_arrive(cur_fbarV);
+          consumer_sync();
+        }
+      } // end kv loop
+
+      // ---- Epilogue: single TMEM readout -> normalize -> global (unchanged) ----
+      {
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        float o_row[D];
+        #pragma unroll
+        for(int c = 0; c < D; c += 32) tmem_ld32(TMEM_O_COL + (uint32_t)c, &o_row[c]);
+        tmem_wait_ld();
+        const float denom = sl[tid];
+        #pragma unroll
+        for(int c = 0; c < D; c += 2)
+          *reinterpret_cast<__nv_bfloat162*>(&d_O[qBase + (long)tid * D + c]) =
+              __floats2bfloat162_rn(o_row[c] / denom, o_row[c + 1] / denom);
+
+        float m_final;
+        tmem_ld_scalar(TMEM_M_COL, m_final);
+        tmem_wait_ld();
+        d_LSE[lBase + tid] = 0.6931471805599453f * (m_final * scale_l2e + log2f(sl[tid]));
+      }
+    }
+
+    __syncthreads();
+  } // end pass loop
+
+  if(tid < 32)
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                 :: "r"(tmem_addr), "r"(NCOLS) : "memory");
+}
+
+// =============================================================================
+template<int Br, int Bc, int D>
+void launch_gqa_v49_causal(
+  __nv_bfloat16 *d_Q, __nv_bfloat16 *d_K, __nv_bfloat16 *d_V,
+  __nv_bfloat16 *d_O, float *d_LSE,
+  int B, int Hq, int Hkv, int S, int G, float scale
+){
+  static_assert(Br == 128 && Br == Bc && D == 64, "see kernel static_asserts");
+  assert((S / Br) % 2 == 0);
+
+  dim3 GRID(B * Hq * ((S / Br) / 2), 1, 1);
+  dim3 BLOCK(160);
+
+  static bool cfgd = false;
+  static CUtensorMap Qtmap, Ktmap, Vtmap;
+  if(!cfgd){
+    const uint64_t kvRows = (uint64_t)B * Hkv * S;
+    const uint64_t qRows  = (uint64_t)B * Hq  * S;
+    Qtmap = make_tma_2d_sw128(d_Q, qRows,  (uint64_t)D, (uint32_t)Br, (uint32_t)D);  // was make_tma_3d_katom
+    Ktmap = make_tma_2d_sw128(d_K, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    Vtmap = make_tma_2d_sw128(d_V, kvRows, (uint64_t)D, (uint32_t)Bc, (uint32_t)D);
+    cfgd = true;
+  }
+  gqa_v49_causal<Br, Bc, D><<<GRID, BLOCK>>>(d_O, d_LSE, Qtmap, Ktmap, Vtmap,
+                                               B, Hq, Hkv, G, S, scale);
+}
+
+
 int main(){
   std::cout << "Benchmarking CAUSAL Grouped-Query Attention — Blackwell SM_103 (B300), v3 file\n";
 
@@ -1888,10 +2274,11 @@ int main(){
   };
 
   if(has_ref){
-    runCorrectness("V42-causal",   [&](){ launch_gqa_v42_causal<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); });
+    runCorrectness("V42-causal", [&](){ launch_gqa_v42_causal<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); });
     runCorrectness("V46-causal", [&](){ launch_gqa_v46_causal<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); });
     runCorrectness("V47-causal", [&](){ launch_gqa_v47_causal<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); });
     runCorrectness("V48-causal", [&](){ launch_gqa_v48_causal<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); });
+    runCorrectness("V49-causal", [&](){ launch_gqa_v49_causal<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); });
   }
 
   //* ── Benchmark ──────────────────────────────────────────────────────────
@@ -1928,6 +2315,13 @@ int main(){
     100, 25, flops, bytes
   );
   displayStats("V48-causal — V47 + Q load via plain SWIZZLE_128B 2D map too (replacing Q's own "
+               "atom-native 3D box) -- tests whether Q, not K, was the dominant uncoalesced-access source", stats);
+
+  stats = benchmarkKernel(
+    [&](){ launch_gqa_v49_causal<Br, Bc, D>(d_Q, d_K, d_V, d_O, d_LSE, B, Hq, Hkv, S, G, scale); },
+    100, 25, flops, bytes
+  );
+  displayStats("V48 + double-buffered S in TMEM + early QK^T issue."
                "atom-native 3D box) -- tests whether Q, not K, was the dominant uncoalesced-access source", stats);
 
   // Add new versions here: runCorrectness + benchmarkKernel/displayStats,
